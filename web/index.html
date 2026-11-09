@@ -40,16 +40,21 @@
   select:disabled{background:#f3f4f7;color:#8b93a3;border-color:#eef1f6;cursor:not-allowed}
   input[type=number]{width:66px;text-align:center}
 
-  .wrap{padding:0 18px 90px}
+  .wrap{padding:0 18px 90px;overflow-x:auto}
   table{width:100%;border-collapse:separate;border-spacing:0 6px}
+  .wrap table{table-layout:fixed}   /* 定宽 + colgroup，文件列才能拖窄（auto 列宽由内容撑住，缩不动） */
   th{font-size:12px;color:var(--muted);font-weight:500;text-align:left;padding:6px 10px;white-space:nowrap}
+  th.c-file{position:relative}
+  th.c-file::after{content:'';position:absolute;top:5px;bottom:5px;right:-4px;width:9px;
+                   border-radius:3px;cursor:col-resize}
+  th.c-file:hover::after{background:var(--line)}
   td{background:var(--card);padding:7px 10px;border-top:1px solid var(--line);
      border-bottom:1px solid var(--line);white-space:nowrap}
   td:first-child{border-left:1px solid var(--line);border-radius:8px 0 0 8px}
   td:last-child{border-right:1px solid var(--line);border-radius:0 8px 8px 0}
   tr.row:hover td{background:#fbfcfe}
-  .name{max-width:30vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block}
-  td.c-file{width:100%}
+  .name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block}
+  select{max-width:100%}            /* 定宽列里别把下拉框顶出去 */
   .name a{color:var(--text);text-decoration:none;font-weight:500}
   .name a:hover{color:var(--accent);text-decoration:underline}
   .sub{color:var(--muted);font-size:11px;margin-top:1px}
@@ -123,9 +128,15 @@
 
 <div class="wrap">
   <table>
+    <colgroup>
+      <col style="width:36px"><col id="colFile">
+      <col style="width:62px"><col id="colSize" style="width:78px"><col style="width:66px">
+      <col id="colPrinter"><col style="width:86px"><col style="width:84px">
+      <col style="width:84px"><col style="width:116px"><col style="width:84px"><col><!-- 最后一列吃掉剩余宽度 -->
+    </colgroup>
     <thead><tr>
-      <th style="width:30px"><input type="checkbox" id="chkAll" checked onchange="toggleAll(this.checked)"></th>
-      <th>文件</th><th>页数</th><th>尺寸</th><th>方向</th>
+      <th><input type="checkbox" id="chkAll" checked onchange="toggleAll(this.checked)"></th>
+      <th class="c-file" title="拖动右边界可调宽">文件</th><th>页数</th><th>尺寸</th><th>方向</th>
       <th>打印机</th><th>份数</th><th>色彩</th><th>纸张</th><th>双面方式</th><th>状态</th><th></th>
     </tr></thead>
     <tbody id="tbody"></tbody>
@@ -300,7 +311,7 @@ function render(){
     return `<tr class="row" data-n="${esc(f.name)}">
       <td><input type="checkbox" class="c-sel" ${s.sel?'checked':''}></td>
       <td class="c-file">
-        <span class="name"><a href="/pdf/${encodeURIComponent(f.name)}" target="_blank" title="${esc(f.detail)}">${esc(f.name)}</a></span>
+        <span class="name"><a href="/pdf/${encodeURIComponent(f.name)}#view=Fit" target="_blank" title="${esc(f.detail)}">${esc(f.name)}</a></span>
         <div class="sub">${f.mb} MB${f.kind ? ' · ' + f.kind + ' 转 PDF' : ''}</div>
       </td>
       <td><b>${f.pages}</b></td>
@@ -319,8 +330,71 @@ function render(){
           <button class="mini" data-act="one">打印</button></td>
     </tr>`;
   }).join('');
+  fitPrinterCol();
+  fitSizeCol();
+  fitFileCol();
   updateStat();
 }
+
+// 尺寸列：可能是「A4」，也可能是「800×1200mm」。badge 撑出单元格时 offsetWidth 仍是真实宽度，
+// 量出来按需加宽（只增不减，避免刷新时列宽抖动）。
+function fitSizeCol(){
+  let w = 0;
+  for (const td of document.querySelectorAll('#tbody tr td:nth-child(4)'))
+    w = Math.max(w, td.firstElementChild ? td.firstElementChild.offsetWidth : td.scrollWidth);
+  const col = $('#colSize'), need = w + 20;          // + 单元格左右 padding
+  if (need > (parseFloat(col.style.width) || 0)){
+    col.style.width = need + 'px';
+    // 尺寸列变宽了就把文件列压回去，别让整表顶出容器
+    if (FILE_W){ FILE_W = Math.min(FILE_W, roomForFile()); $('#colFile').style.width = FILE_W + 'px'; }
+  }
+}
+
+// 打印机名长短不定（带 emoji 前缀），按最长选项量一次，别手写死宽度
+function fitPrinterCol(){
+  const probe = document.createElement('select');
+  probe.style.cssText = 'position:absolute;left:-9999px;top:0;visibility:hidden';
+  probe.innerHTML = CFG.printers.map(p => `<option>${esc(p)}</option>`).join('');
+  document.body.appendChild(probe);
+  const w = probe.offsetWidth;
+  probe.remove();
+  if (w) $('#colPrinter').style.width = (w + 22) + 'px';
+}
+
+// 文件列：首次按最长文件名定宽（scrollWidth 是被 ellipsis 裁掉后的真实内容宽），之后以拖动为准
+let FILE_W = 0;
+function colTable(){ return document.querySelector('.wrap table'); }
+function fixedCols(){          // 除文件列外所有固定列宽之和
+  let s = 0;
+  for (const c of colTable().querySelectorAll('colgroup col'))
+    if (c.id !== 'colFile' && c.style.width) s += parseFloat(c.style.width);
+  return s;
+}
+function roomForFile(){        // 文件列可用的最大宽：给右侧按钮列留 120
+  return Math.max(180, colTable().clientWidth - fixedCols() - 120);
+}
+function fitFileCol(){
+  if (FILE_W) return;
+  let w = 0;
+  for (const el of document.querySelectorAll('.name')) w = Math.max(w, el.scrollWidth);
+  FILE_W = Math.round(Math.max(180, Math.min(w + 26, roomForFile(), innerWidth * .45)));
+  $('#colFile').style.width = FILE_W + 'px';
+}
+
+// 拖动「文件」列头右边界调宽
+$('th.c-file').addEventListener('pointerdown', e => {
+  const th = e.currentTarget, x0 = e.clientX, w0 = th.offsetWidth, max = roomForFile();
+  th.setPointerCapture(e.pointerId);
+  e.preventDefault();
+  const mv = ev => {
+    FILE_W = Math.round(Math.min(Math.max(160, w0 + ev.clientX - x0), max));
+    $('#colFile').style.width = FILE_W + 'px';
+  };
+  const end = () => th.removeEventListener('pointermove', mv);
+  th.addEventListener('pointermove', mv);
+  th.addEventListener('pointerup', end, {once: true});
+  th.addEventListener('pointercancel', end, {once: true});
+});
 
 function amount(f, s){
   const u = (CFG.prices || {})[s.paper + '|' + (s.color ? 1 : 0)] || 0;
@@ -448,7 +522,7 @@ function openPv(name){
   $('#pvTitle').textContent = name;
   $('#pvMeta').textContent = f.detail || '';
   $('#pvTab').dataset.n = name;
-  $('#pvFrame').src = '/pdf/' + encodeURIComponent(name);
+  $('#pvFrame').src = '/pdf/' + encodeURIComponent(name) + '#view=Fit';  // 内置阅读器默认整页
   $('#pv').classList.add('show');
 }
 
@@ -459,7 +533,7 @@ function closePv(){
 
 $('#pv').addEventListener('click', e=>{ if (e.target.id === 'pv') closePv(); });
 $('#pvTab').addEventListener('click', e=>
-  window.open('/pdf/' + encodeURIComponent(e.currentTarget.dataset.n), '_blank'));
+  window.open('/pdf/' + encodeURIComponent(e.currentTarget.dataset.n) + '#view=Fit', '_blank'));
 document.addEventListener('keydown', e=>{
   if (e.key === 'Escape' && $('#pv').classList.contains('show')) closePv();
 });
