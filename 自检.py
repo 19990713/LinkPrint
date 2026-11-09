@@ -138,6 +138,26 @@ finally:
     if sp and os.path.isfile(sp):
         os.remove(sp)
 
+# ---------------- 打印效果预览 ----------------
+# 排版规则必须和 build_settings 发出去的一致，否则预览会撒谎
+A4W, A4H = 210 * 72 / 25.4, 297 * 72 / 25.4
+rot, k, _r, over = ps.print_layout(A4W, A4H, "A4", "fit")
+assert rot == 0 and not over and abs(k - (210 - 8) / 210) < 1e-3, (k, over)   # A4 打 A4 = 96%
+rot, k, _r, over = ps.print_layout(A4W, A4H, "A3", "fit")
+assert abs(k - 289 / 210) < 0.01, k                    # A4 内容打 A3 会放大到 ~138%
+rot, k, _r, over = ps.print_layout(A4H, A4W, "A4", "fit")
+assert rot == 90, rot                                  # 横向页自动转 90°
+rot, k, _r, over = ps.print_layout(A4W, A4H, "A4", "custom", 130)
+assert abs(k - 1.3) < 1e-6 and over, (k, over)         # 130% 超出纸面，要标"会被裁"
+rot, k, _r, over = ps.print_layout(A4W, A4H, "A4", "noscale")
+assert abs(k - 1.0) < 1e-6 and not over, (k, over)     # 实际大小不算超纸
+png, meta = ps.preview_png(files[0], "A4", "fit", 100, 1, True, 80)
+assert png[:8] == b"\x89PNG\r\n\x1a\n", "应该是 PNG"
+with fitz.open(files[0]) as _d:
+    assert meta["pages"] == _d.page_count, meta
+assert meta["pct"] == 96 and meta["rot"] == 0 and (meta["w"], meta["h"]) == (210, 297), meta
+print(f"打印效果预览 OK  首屏 {meta['pct']}% {meta['w']}×{meta['h']}mm {len(png)//1024}KB")
+
 # ---------------- 切换热文件夹 ----------------
 import json
 orig_cfg = json.load(open(ps.CFG_PATH, encoding="utf-8"))

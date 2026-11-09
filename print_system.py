@@ -16,7 +16,7 @@ import time
 import webbrowser
 from collections import Counter
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 try:
     import pymupdf as fitz
@@ -36,6 +36,9 @@ DEFAULT_CFG = {
     "sumatra": "SumatraPDF.exe",
     # Office -> PDF 转换器（WPS COM）。找不到它就只支持 PDF
     "convert2pdf": r"D:\脚本文件\多文件合并PDF\Convert2PDF.ps1",
+    # 打印效果预览里，纸张四边扣掉多少毫米当"不可打印区"（估算）。
+    # 驱动真实边距拿不到，4mm 大致对应 A4 满幅时 Acrobat 显示的 96%。
+    "preview_margin_mm": 4,
 }
 
 # 标准纸张 mm（宽 x 高），容忍 ±2mm
@@ -281,6 +284,116 @@ def prune_cache(days=7):
                 os.remove(f.path)
             except OSError:
                 pass
+
+
+# ---------------- 打印效果预览 ----------------
+# 和 Acrobat 打印对话框右侧那格一个意思：把「照当前参数打出来会是什么样」画成一张纸。
+# 它不负责看清内容（那是原文件预览的事），而是看缩放比、有没有被裁、横向页有没转对。
+
+def paper_mm(paper):
+    """纸张名 -> (宽 mm, 高 mm)。不认识的按 A4。"""
+    return STD_SIZES.get(paper) or STD_SIZES["A4"]
+
+
+def print_layout(page_w, page_h, paper, mode="fit", pct=100, margin_mm=None):
+    """模拟 SumatraPDF 的排版规则，返回 (旋转角, 缩放比, 目标矩形, 是否超出纸面)。
+
+    坐标用 pt、原点在纸张左上角。规则对应 build_settings 发出的参数：
+    - 自动旋转：页面与纸张的横竖方向不一致就转 90°（Sumatra 的行为）
+    - fit：缩放到「纸张减去不可打印边距」，可缩也可放大
+    - shrink：同上但只缩不放，小页面维持 100%
+    - noscale：固定 100%
+    - custom：固定 pct%，超过 100% 的部分被纸裁掉（和 Acrobat 一致）
+    """
+    if margin_mm is None:
+        try:
+            margin_mm = float(CFG.get("preview_margin_mm", 4))
+        except (TypeError, ValueError):
+            margin_mm = 4.0
+    wmm, hmm = paper_mm(paper)
+    pw, ph = wmm * 72 / 25.4, hmm * 72 / 25.4
+    m = max(0.0, margin_mm) * 72 / 25.4
+    area_w, area_h = max(pw - 2 * m, 1.0), max(ph - 2 * m, 1.0)
+
+    rot = 90 if (page_w > page_h) != (pw > ph) else 0
+    w, h = (page_h, page_w) if rot else (page_w, page_h)
+    if mode == "noscale":
+        k = 1.0
+    elif mode == "custom":
+        k = min(4.0, max(0.1, float(pct) / 100.0))
+    elif mode == "shrink":
+        k = min(1.0, min(area_w / w, area_h / h))
+    else:                                     # fit
+        k = min(area_w / w, area_h / h)
+    tw, th = w * k, h * k
+    x0, y0 = (pw - tw) / 2, (ph - th) / 2
+    # 只有超出纸张本身才算会被裁（贴着可打印边距不算，Acrobat 也不提示）
+    over = tw > pw + 0.5 or th > ph + 0.5
+    return rot, k, fitz.Rect(x0, y0, x0 + tw, y0 + th), over
+
+
+def _rotate_pixmap(pix, rot):
+    """把位图按顺时针 90° 的整数倍旋转。用来绕开一个坑：
+    源页自带 /Rotate 时 show_pdf_page 不认它，自己转更可靠。"""
+    rot %= 360
+    if not rot:
+        return pix
+    import numpy as np
+    a = np.frombuffer(pix.samples, dtype=np.uint8)
+    a = a.reshape(pix.height, pix.stride // pix.n, pix.n)[:, :pix.width, :]
+    a = np.ascontiguousarray(np.rot90(a, k=(4 - rot // 90) % 4))   # np.rot90 是逆时针
+    h, w = a.shape[:2]
+    cs = fitz.csGRAY if pix.n == 1 else fitz.csRGB
+    return fitz.Pixmap(cs, w, h, a.tobytes(), False)
+
+
+def preview_png(src, paper, mode="fit", pct=100, page_no=1, gray=False, dpi=120):
+    """按打印参数渲染整张纸的预览图，返回 (png bytes, 元信息 dict)。"""
+    doc = fitz.open(printable_pdf(src))
+    try:
+        if doc.needs_pass:
+            raise RuntimeError("PDF 有密码，无法预览")
+        n = doc.page_count
+        if not n:
+            raise RuntimeError("文档里没有页面")
+        pno = max(1, min(int(page_no), n))
+        pg = doc[pno - 1]
+        page_rot = pg.rotation          # 源页自带的 /Rotate，get_pixmap 会应用
+        rot, k, rect, over = print_layout(pg.rect.width, pg.rect.height,
+                                          paper, mode, pct)
+        wmm, hmm = paper_mm(paper)
+        pw, ph = wmm * 72 / 25.4, hmm * 72 / 25.4
+        out = fitz.open()
+        try:
+            # 自定义比例 >100% 时内容会超到纸外。show_pdf_page / insert_image
+            # 遇到越界矩形会静默画空白，所以先把页面放大到「纸张 ∪ 内容」的包围盒，
+            # 画完再在渲染时用 clip 只取纸张那一块。
+            # +0.01pt 是给 new_page 的单精度量化留余量。
+            bx0, by0 = min(0.0, rect.x0), min(0.0, rect.y0)
+            bx1, by1 = max(pw, rect.x1), max(ph, rect.y1)
+            np_ = out.new_page(width=bx1 - bx0 + 0.01, height=by1 - by0 + 0.01)
+            target = fitz.Rect(rect.x0 - bx0, rect.y0 - by0,
+                               rect.x1 - bx0, rect.y1 - by0)
+            if page_rot:
+                # 带 /Rotate 的页面走位图：先按呈现方向渲染（get_pixmap 认
+                # /Rotate），自己转到位再贴。多一次重采样，但方向不会错。
+                src_dpi = max(120, min(300, int(round(dpi / max(k, 0.05)))))
+                np_.insert_image(target, pixmap=_rotate_pixmap(pg.get_pixmap(dpi=src_dpi), rot))
+            else:
+                # 普通页面走矢量：show_pdf_page 只搬内容流，不重采样
+                np_.show_pdf_page(target, doc, pno - 1, rotate=rot)
+            paper_rect = fitz.Rect(-bx0, -by0, pw - bx0, ph - by0)
+            pix = np_.get_pixmap(clip=paper_rect, dpi=max(60, min(int(dpi), 200)),
+                                 colorspace=fitz.csGRAY if gray else fitz.csRGB,
+                                 alpha=False)
+            png = pix.tobytes("png")
+        finally:
+            out.close()
+    finally:
+        doc.close()
+    meta = {"page": pno, "pages": n, "pct": int(round(k * 100)),
+            "rot": rot, "w": wmm, "h": hmm, "over": bool(over)}
+    return png, meta
 
 
 
@@ -549,7 +662,7 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
-    def _send(self, code, body, ctype="application/json; charset=utf-8"):
+    def _send(self, code, body, ctype="application/json; charset=utf-8", headers=None):
         if isinstance(body, (dict, list)):
             body = json.dumps(body, ensure_ascii=False)
         if isinstance(body, str):
@@ -558,6 +671,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        for k, v in (headers or {}).items():     # 自定义头只放 ASCII，中文别往里塞
+            self.send_header(k, str(v))
         self.end_headers()
         self.wfile.write(body)
 
@@ -598,6 +713,25 @@ class Handler(BaseHTTPRequestHandler):
                                                 "application/octet-stream")
             with open(fp, "rb") as f:
                 return self._send(200, f.read(), ctype)
+        if p == "/api/printpreview":
+            q = parse_qs(u.query)
+            g = lambda k, d: (q.get(k) or [d])[0]
+            name = os.path.basename(g("name", ""))
+            fp = os.path.join(HOT, name)
+            if not name or not os.path.isfile(fp):
+                return self._send(404, {"error": "文件不存在"})
+            try:
+                png, meta = preview_png(
+                    fp, g("paper", "A4"), g("scale", "fit"),
+                    float(g("pct", "100")), int(g("page", "1")),
+                    g("gray", "0") in ("1", "true"), int(g("dpi", "120")))
+            except Exception as e:
+                return self._send(400, {"error": str(e)})
+            return self._send(200, png, "image/png", {
+                "X-LP-Pct": meta["pct"], "X-LP-Rot": meta["rot"],
+                "X-LP-Page": meta["page"], "X-LP-Pages": meta["pages"],
+                "X-LP-W": meta["w"], "X-LP-H": meta["h"],
+                "X-LP-Over": 1 if meta["over"] else 0})
         if p.startswith("/pdf/"):
             name = os.path.basename(unquote(p[5:]))
             fp = os.path.join(HOT, name)

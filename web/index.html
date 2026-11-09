@@ -100,7 +100,26 @@
   .modal .mbody td:last-child{border-right:0;border-radius:0}
   .modal .mbody tr:hover td{background:#fafbfd}
   .pv-sheet{max-width:1100px;height:100%}
-  .pv-sheet iframe{flex:1;width:100%;min-height:0;border:0;background:#f0f2f6}
+  .pv-body{flex:1;min-height:0;display:flex}
+  .pv-sheet iframe{flex:1;width:100%;min-height:0;border:0;background:#f0f2f6;display:none}
+  /* 「打印效果」：整张纸渲染成图，看的就是送去打印机那一刻的样子 */
+  .pv-effect{flex:1;min-height:0;display:flex;flex-direction:column;background:#eceff5;
+             position:relative}
+  .pv-stage{flex:1;min-height:0;display:flex;align-items:center;justify-content:center;
+            padding:18px 22px 8px;overflow:hidden}
+  .pv-stage img{max-width:100%;max-height:100%;display:block;background:#fff;
+                box-shadow:0 3px 16px rgba(20,30,60,.22);transition:opacity .15s}
+  .pv-nav{display:flex;align-items:center;justify-content:center;gap:10px;
+          padding:8px 16px 12px;font-size:12px;color:var(--muted);flex-wrap:wrap}
+  .pv-nav .pg{min-width:96px;text-align:center}
+  .pv-tag{background:#fff;border:1px solid var(--line);border-radius:999px;padding:2px 10px;
+          white-space:nowrap}
+  .pv-warn{color:#c2410c;font-weight:600}
+  .seg{display:flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+  .seg button{border:0;border-radius:0;background:#fff;padding:5px 12px;font-size:12px;
+              color:var(--muted)}
+  .seg button+button{border-left:1px solid var(--line)}
+  .seg button.on{background:var(--accent-soft);color:var(--accent);font-weight:600}
 </style>
 </head>
 <body>
@@ -191,10 +210,26 @@
       <b id="pvTitle"></b>
       <span class="hint" id="pvMeta"></span>
       <div class="grow"></div>
+      <div class="seg" id="pvTabs">
+        <button data-tab="effect" class="on">打印效果</button>
+        <button data-tab="raw">原文件</button>
+      </div>
       <button class="mini" id="pvTab">新标签打开</button>
       <button class="mini" onclick="closePv()">关闭</button>
     </div>
-    <iframe id="pvFrame" title="文件预览"></iframe>
+    <div class="pv-body">
+      <div class="pv-effect" id="pvEffect">
+        <div class="pv-stage"><img id="pvImg" alt="打印效果预览"></div>
+        <div class="pv-nav">
+          <button class="mini" id="pvPrev" title="上一页">‹</button>
+          <span class="pg" id="pvPage">第 1 页 / 共 1 页</span>
+          <button class="mini" id="pvNext" title="下一页">›</button>
+          <span class="pv-tag" id="pvPct">—</span>
+          <span class="pv-warn" id="pvWarn"></span>
+        </div>
+      </div>
+      <iframe id="pvFrame" title="文件预览"></iframe>
+    </div>
   </div>
 </div>
 
@@ -551,28 +586,112 @@ $('#tbody').addEventListener('click', e=>{
   else if (act === 'one') send([tr.dataset.n]);
 });
 
-// 预览：iframe 直接吃 /pdf/ 返回的可打印 PDF（Office/图片已是转好的缓存），翻页缩放交给浏览器阅读器
+// ---------------- 预览 ----------------
+// 「打印效果」：后端按这一行的纸张/缩放/色彩把整张纸渲染成 PNG，和 Acrobat 打印
+// 对话框右边那格一个用途 —— 核对缩放比、有没有被裁、横向页有没有转对。
+// 「原文件」：原来的 iframe 直连 PDF，用来看内容细节（字体、缺页）。
+const SCALE_TXT = {fit:'适合', noscale:'实际大小', shrink:'缩小过大', custom:'自定义'};
+let PV = {name:'', page:1, pages:1, tab:'effect', req:0, obj:'', s:null};
+
+function pvSummary(s, pages){
+  const sc = s.scale === 'custom' ? `自定义 ${s.pct}%` : (SCALE_TXT[s.scale] || '适合');
+  return `${s.paper} · ${sc} · ${s.color ? '彩色' : '黑白'} · ${pages} 页`;
+}
+
 function openPv(name){
   const f = FILES.find(x=> x.name === name);
   if (!f) return;
   if (f.error) return toast('这份文件无法预览：' + f.detail, true);
+  const s = ROWS[name] || {paper:'A4', scale:'fit', pct:100, color:0};
+  PV = {name, page:1, pages:f.pages || 1, tab:'effect', req:0, obj:'', s};
   $('#pvTitle').textContent = name;
-  $('#pvMeta').textContent = f.detail || '';
+  $('#pvMeta').textContent = pvSummary(s, f.pages || 0);
   $('#pvTab').dataset.n = name;
-  $('#pvFrame').src = '/pdf/' + encodeURIComponent(name) + '#view=Fit';  // 内置阅读器默认整页
+  $('#pvFrame').src = 'about:blank';   // 换文件了，别让上一个的 PDF 留在 iframe 里
   $('#pv').classList.add('show');
+  setPvTab('effect');
+}
+
+function setPvTab(tab){
+  PV.tab = tab;
+  for (const b of $('#pvTabs').querySelectorAll('button'))
+    b.classList.toggle('on', b.dataset.tab === tab);
+  const eff = tab === 'effect';
+  $('#pvEffect').style.display = eff ? 'flex' : 'none';
+  $('#pvFrame').style.display = eff ? 'none' : 'block';
+  if (eff) loadEffect(PV.page);
+  else if ($('#pvFrame').src.indexOf('about:blank') !== -1)
+    $('#pvFrame').src = '/pdf/' + encodeURIComponent(PV.name) + '#view=Fit';
+}
+
+// 每次翻页向后端要一张「整张纸」的图；响应头带回真实缩放比和纸张尺寸
+function loadEffect(page){
+  if (!PV.s) return;
+  const p = Math.max(1, Math.min(page || 1, PV.pages));
+  PV.page = p;
+  const id = ++PV.req, s = PV.s;
+  const q = new URLSearchParams({name:PV.name, paper:s.paper, scale:s.scale,
+                                 pct:s.pct, page:p, gray:s.color ? 0 : 1, dpi:130});
+  $('#pvPage').textContent = `第 ${p} 页 / 共 ${PV.pages} 页`;
+  $('#pvImg').style.opacity = .35;
+  $('#pvWarn').textContent = '';
+  fetch('/api/printpreview?' + q).then(async r => {
+    if (!r.ok){
+      let msg = '渲染失败';
+      try { msg = (await r.json()).error || msg; } catch(e){}
+      throw new Error(msg);
+    }
+    return {blob: await r.blob(), pct:+r.headers.get('X-LP-Pct'),
+            rot:+r.headers.get('X-LP-Rot'), w:+r.headers.get('X-LP-W'),
+            h:+r.headers.get('X-LP-H'), over:r.headers.get('X-LP-Over') === '1'};
+  }).then(o => {
+    if (id !== PV.req) return;                       // 关掉或翻过页了，丢弃
+    if (PV.obj) URL.revokeObjectURL(PV.obj);
+    PV.obj = URL.createObjectURL(o.blob);
+    const img = $('#pvImg');
+    img.src = PV.obj;
+    img.style.opacity = 1;
+    $('#pvPct').textContent = `${o.pct}%　${o.w}×${o.h}mm` + (o.rot ? '　已旋转90°' : '');
+    $('#pvPct').title = '按纸张减去不可打印边距估算（config 里 preview_margin_mm 可调），'
+                      + '实际比例由打印机驱动决定';
+    $('#pvWarn').textContent = o.over ? '⚠ 内容超出纸面，超出部分会被裁掉' : '';
+  }).catch(err => {
+    if (id !== PV.req) return;
+    $('#pvImg').style.opacity = 1;
+    $('#pvWarn').textContent = '⚠ ' + err.message;
+  });
 }
 
 function closePv(){
+  PV.req++;                                         // 作废在途请求
   $('#pv').classList.remove('show');
-  $('#pvFrame').src = 'about:blank';   // 停掉加载，别让大文件一直占着内存
+  $('#pvFrame').src = 'about:blank';                // 停掉加载，别让大文件一直占着内存
+  if (PV.obj){ URL.revokeObjectURL(PV.obj); PV.obj = ''; }
+  $('#pvImg').removeAttribute('src');
 }
 
 $('#pv').addEventListener('click', e=>{ if (e.target.id === 'pv') closePv(); });
+$('#pvTabs').addEventListener('click', e=>{
+  const b = e.target.closest('button[data-tab]');
+  if (b) setPvTab(b.dataset.tab);
+});
+$('#pvPrev').addEventListener('click', ()=>{
+  if (PV.tab === 'effect' && PV.page > 1) loadEffect(PV.page - 1);
+});
+$('#pvNext').addEventListener('click', ()=>{
+  if (PV.tab === 'effect' && PV.page < PV.pages) loadEffect(PV.page + 1);
+});
 $('#pvTab').addEventListener('click', e=>
   window.open('/pdf/' + encodeURIComponent(e.currentTarget.dataset.n) + '#view=Fit', '_blank'));
 document.addEventListener('keydown', e=>{
-  if (e.key === 'Escape' && $('#pv').classList.contains('show')) closePv();
+  if (!$('#pv').classList.contains('show')) return;
+  if (e.key === 'Escape') return closePv();
+  if (PV.tab !== 'effect') return;
+  if (e.key === 'ArrowLeft' || e.key === 'PageUp'){
+    if (PV.page > 1) loadEffect(PV.page - 1);
+  } else if (e.key === 'ArrowRight' || e.key === 'PageDown'){
+    if (PV.page < PV.pages) loadEffect(PV.page + 1);
+  }
 });
 
 function toggleAll(v){
@@ -653,6 +772,7 @@ loadLog();
 setInterval(()=>refresh(), 4000);
 setInterval(poll, 1500);
 setInterval(loadLog, 60000);
+
 </script>
 </body>
 </html>
