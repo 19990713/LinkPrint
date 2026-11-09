@@ -592,6 +592,8 @@ $('#tbody').addEventListener('click', e=>{
 // 「原文件」：原来的 iframe 直连 PDF，用来看内容细节（字体、缺页）。
 const SCALE_TXT = {fit:'适合', noscale:'实际大小', shrink:'缩小过大', custom:'自定义'};
 let PV = {name:'', page:1, pages:1, tab:'effect', req:0, obj:'', s:null};
+let wheelAcc = 0, wheelLock = 0;   // 滚轮翻页的累计位移与冷却时刻
+let lastWheelAt = 0, gestureDone = false;  // 一次连续滑动里是否已经翻过
 
 function pvSummary(s, pages){
   const sc = s.scale === 'custom' ? `自定义 ${s.pct}%` : (SCALE_TXT[s.scale] || '适合');
@@ -604,6 +606,8 @@ function openPv(name){
   if (f.error) return toast('这份文件无法预览：' + f.detail, true);
   const s = ROWS[name] || {paper:'A4', scale:'fit', pct:100, color:0};
   PV = {name, page:1, pages:f.pages || 1, tab:'effect', req:0, obj:'', s};
+  wheelAcc = 0; wheelLock = 0;        // 换文件了，别带着上一次的滚轮残余
+  gestureDone = false; lastWheelAt = 0;
   $('#pvTitle').textContent = name;
   $('#pvMeta').textContent = pvSummary(s, f.pages || 0);
   $('#pvTab').dataset.n = name;
@@ -685,22 +689,59 @@ $('#pvTabs').addEventListener('click', e=>{
   const b = e.target.closest('button[data-tab]');
   if (b) setPvTab(b.dataset.tab);
 });
-$('#pvPrev').addEventListener('click', ()=>{
-  if (PV.tab === 'effect' && PV.page > 1) loadEffect(PV.page - 1);
-});
-$('#pvNext').addEventListener('click', ()=>{
-  if (PV.tab === 'effect' && PV.page < PV.pages) loadEffect(PV.page + 1);
-});
+// 相对翻页，越界就不动（按钮、键盘、滚轮共用一套边界判断）
+function pvGo(d){
+  const t = PV.page + d;
+  if (PV.tab !== 'effect' || t < 1 || t > PV.pages) return;
+  loadEffect(t);
+}
+$('#pvPrev').addEventListener('click', ()=> pvGo(-1));
+$('#pvNext').addEventListener('click', ()=> pvGo(1));
+
+// 滚轮换页：只作用于「打印效果」（原文件里滚轮归浏览器阅读器自己管）。
+// 难点是「一次滑动 ≠ 一个事件」：触控板一次轻划会连发几十个 wheel，惯性尾巴能拖半秒。
+// 所以按手势收口 —— 同一次连续滑动（事件间隔 < GESTURE_GAP）里最多翻一页，
+// 手停了才算这次手势结束。鼠标滚轮一格通常 ≥90px，单独走「立即翻页」分支。
+const WHEEL_STEP = 50;     // 触控板：累计到这么多像素才算一次翻页意图
+const WHEEL_MOUSE = 90;    // 一次 wheel 就有这么大 → 认定是鼠标滚轮的一格
+const WHEEL_COOL = 220;    // 触控板翻页后的冷却，吃掉惯性尾巴
+const WHEEL_COOL_M = 120;  // 鼠标的冷却短一些，连滚可以连着翻
+const GESTURE_GAP = 160;   // 事件间隔超过这个就算新手势
+$('#pvEffect').addEventListener('wheel', e => {
+  if (PV.tab !== 'effect' || PV.pages < 2) return;
+  if (Math.abs(e.deltaY) <= Math.abs(e.deltaX)) return;   // 横向滑动不翻页
+  e.preventDefault();                                     // 别让背景跟着滚
+  const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? 400 : 1;
+  const d = e.deltaY * unit;
+  const now = performance.now();
+  if (now - lastWheelAt > GESTURE_GAP) gestureDone = false;  // 停顿够了，新手势
+  lastWheelAt = now;
+  if (now < wheelLock) return;                               // 冷却期：吞掉惯性
+  if (Math.abs(d) >= WHEEL_MOUSE){                           // 鼠标滚轮：一格一页
+    wheelAcc = 0; gestureDone = true;
+    wheelLock = now + WHEEL_COOL_M;
+    pvGo(Math.sign(d));
+    return;
+  }
+  if (gestureDone) return;                                   // 本次滑动已经翻过了
+  wheelAcc += d;
+  if (Math.abs(wheelAcc) < WHEEL_STEP) return;
+  const dir = wheelAcc > 0 ? 1 : -1;                         // 向下滚 = 下一页
+  wheelAcc = 0; gestureDone = true;
+  wheelLock = now + WHEEL_COOL;
+  pvGo(dir);
+}, {passive:false});
+
 $('#pvTab').addEventListener('click', e=>
   window.open('/pdf/' + encodeURIComponent(e.currentTarget.dataset.n) + '#view=Fit', '_blank'));
 document.addEventListener('keydown', e=>{
   if (!$('#pv').classList.contains('show')) return;
   if (e.key === 'Escape') return closePv();
   if (PV.tab !== 'effect') return;
-  if (e.key === 'ArrowLeft' || e.key === 'PageUp'){
-    if (PV.page > 1) loadEffect(PV.page - 1);
-  } else if (e.key === 'ArrowRight' || e.key === 'PageDown'){
-    if (PV.page < PV.pages) loadEffect(PV.page + 1);
+  if (e.key === 'ArrowLeft' || e.key === 'PageUp' || e.key === 'ArrowUp'){
+    pvGo(-1);
+  } else if (e.key === 'ArrowRight' || e.key === 'PageDown' || e.key === 'ArrowDown'){
+    pvGo(1);
   }
 });
 
