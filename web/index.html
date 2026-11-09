@@ -90,6 +90,7 @@
          display:flex;flex-direction:column;max-height:100%;overflow:hidden;
          box-shadow:0 18px 50px rgba(20,30,60,.25)}
   .mhead{display:flex;align-items:center;gap:12px;padding:14px 18px;border-bottom:1px solid var(--line)}
+  .mhead b{max-width:42%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}  /* 长文件名别把标签挤走 */
   .mbody{overflow:auto;padding:0 18px}
   .modal .mbody table{width:100%;border-collapse:collapse;border-spacing:0}
   .modal .mbody th{position:sticky;top:0;background:#fff;z-index:1;padding:8px 6px;
@@ -130,6 +131,7 @@
   <button class="mini" onclick="pickFolder()">更换文件夹</button>
   <button class="mini" onclick="openFolder()">打开文件夹</button>
   <div class="grow"></div>
+  <button class="mini" onclick="openPvAll()" title="在一个窗口里连续翻看所有文件的每一页">全部预览</button>
   <button onclick="refresh(true)">刷新</button>
   <button class="primary" id="btnAll" onclick="printAll()">全部发出打印</button>
 </header>
@@ -591,13 +593,14 @@ $('#tbody').addEventListener('click', e=>{
 // 对话框右边那格一个用途 —— 核对缩放比、有没有被裁、横向页有没有转对。
 // 「原文件」：原来的 iframe 直连 PDF，用来看内容细节（字体、缺页）。
 const SCALE_TXT = {fit:'适合', noscale:'实际大小', shrink:'缩小过大', custom:'自定义'};
-let PV = {name:'', page:1, pages:1, tab:'effect', req:0, obj:'', s:null};
+let PV = {name:'', page:1, pages:1, tab:'effect', req:0, obj:'', s:null, i:0};
+let PVQ = [];      // 全部预览时的页序列 [{n,p,fi,fn}]，空数组 = 单文件模式
 let wheelAcc = 0, wheelLock = 0;   // 滚轮翻页的累计位移与冷却时刻
 let lastWheelAt = 0, gestureDone = false;  // 一次连续滑动里是否已经翻过
 
 function pvSummary(s, pages){
   const sc = s.scale === 'custom' ? `自定义 ${s.pct}%` : (SCALE_TXT[s.scale] || '适合');
-  return `${s.paper} · ${sc} · ${s.color ? '彩色' : '黑白'} · ${pages} 页`;
+  return `${s.paper} · ${sc} · ${s.color ? '彩色' : '黑白'}` + (pages ? ` · ${pages} 页` : '');
 }
 
 function openPv(name){
@@ -605,13 +608,32 @@ function openPv(name){
   if (!f) return;
   if (f.error) return toast('这份文件无法预览：' + f.detail, true);
   const s = ROWS[name] || {paper:'A4', scale:'fit', pct:100, color:0};
-  PV = {name, page:1, pages:f.pages || 1, tab:'effect', req:0, obj:'', s};
+  PVQ = [];                            // 单文件模式：清掉上一次「全部预览」的序列
+  PV = {name, page:1, pages:f.pages || 1, tab:'effect', req:0, obj:'', s, i:0};
   wheelAcc = 0; wheelLock = 0;        // 换文件了，别带着上一次的滚轮残余
   gestureDone = false; lastWheelAt = 0;
-  $('#pvTitle').textContent = name;
-  $('#pvMeta').textContent = pvSummary(s, f.pages || 0);
   $('#pvTab').dataset.n = name;
   $('#pvFrame').src = 'about:blank';   // 换文件了，别让上一个的 PDF 留在 iframe 里
+  $('#pv').classList.add('show');
+  setPvTab('effect');
+}
+
+// 「全部预览」：把每个文件的每一页摊平成一条序列，一个窗口从头翻到尾，
+// 翻页时按各自那一行的纸张/缩放/色彩渲染，不用一份一份点。
+function openPvAll(){
+  const list = FILES.filter(f => !f.error);
+  if (!list.length) return toast('没有可预览的文件', true);
+  PVQ = [];
+  list.forEach((f, i) => {
+    for (let p = 1; p <= (f.pages || 1); p++)
+      PVQ.push({n: f.name, p, fi: i + 1, fn: list.length});
+  });
+  PV = {name: list[0].name, page: 1, pages: list[0].pages || 1,
+        tab:'effect', req:0, obj:'', s:null, i: 0};
+  wheelAcc = 0; wheelLock = 0;
+  gestureDone = false; lastWheelAt = 0;
+  $('#pvTab').dataset.n = list[0].name;
+  $('#pvFrame').src = 'about:blank';
   $('#pv').classList.add('show');
   setPvTab('effect');
 }
@@ -623,20 +645,33 @@ function setPvTab(tab){
   const eff = tab === 'effect';
   $('#pvEffect').style.display = eff ? 'flex' : 'none';
   $('#pvFrame').style.display = eff ? 'none' : 'block';
-  if (eff) loadEffect(PV.page);
+  if (eff) loadEffect();
   else if ($('#pvFrame').src.indexOf('about:blank') !== -1)
     $('#pvFrame').src = '/pdf/' + encodeURIComponent(PV.name) + '#view=Fit';
 }
 
 // 每次翻页向后端要一张「整张纸」的图；响应头带回真实缩放比和纸张尺寸
-function loadEffect(page){
-  if (!PV.s) return;
-  const p = Math.max(1, Math.min(page || 1, PV.pages));
-  PV.page = p;
-  const id = ++PV.req, s = PV.s;
-  const q = new URLSearchParams({name:PV.name, paper:s.paper, scale:s.scale,
+function loadEffect(){
+  const it = PVQ[PV.i];                      // 全部预览：当前这一页属于哪个文件
+  const name = it ? it.n : PV.name;
+  const p = it ? it.p : PV.page;
+  const s = ROWS[name] || PV.s || {paper:'A4', scale:'fit', pct:100, color:0};
+  const f = FILES.find(x => x.name === name);
+  const pages = (f && f.pages) || 1;
+  const id = ++PV.req;
+  // 切到「原文件」时 iframe 得换成当前这份，所以跨越文件时先清掉旧 PDF
+  if (PV.name !== name) $('#pvFrame').src = 'about:blank';
+  PV.name = name; PV.pages = pages;
+  $('#pvTab').dataset.n = name;      // 「新标签打开」跟着当前文件走
+  const q = new URLSearchParams({name, paper:s.paper, scale:s.scale,
                                  pct:s.pct, page:p, gray:s.color ? 0 : 1, dpi:130});
-  $('#pvPage').textContent = `第 ${p} 页 / 共 ${PV.pages} 页`;
+  $('#pvTitle').textContent = PVQ.length ? `全部预览 · ${name}` : name;
+  $('#pvMeta').textContent = PVQ.length
+    ? `第 ${it.fi}/${it.fn} 个文件 · ${pvSummary(s)}`   // 页码由底部统一显示，这里不重复总页数
+    : pvSummary(s, pages);
+  $('#pvPage').textContent = PVQ.length
+    ? `第 ${PV.i + 1} 页 / 共 ${PVQ.length} 页`
+    : `第 ${p} 页 / 共 ${pages} 页`;
   $('#pvImg').style.opacity = .35;
   $('#pvWarn').textContent = '';
   fetch('/api/printpreview?' + q).then(async r => {
@@ -678,6 +713,7 @@ function loadEffect(page){
 
 function closePv(){
   PV.req++;                                         // 作废在途请求
+  PVQ = [];
   $('#pv').classList.remove('show');
   $('#pvFrame').src = 'about:blank';                // 停掉加载，别让大文件一直占着内存
   if (PV.obj){ URL.revokeObjectURL(PV.obj); PV.obj = ''; }
@@ -691,9 +727,13 @@ $('#pvTabs').addEventListener('click', e=>{
 });
 // 相对翻页，越界就不动（按钮、键盘、滚轮共用一套边界判断）
 function pvGo(d){
-  const t = PV.page + d;
-  if (PV.tab !== 'effect' || t < 1 || t > PV.pages) return;
-  loadEffect(t);
+  if (PV.tab !== 'effect') return;
+  const n = PVQ.length || PV.pages;              // 全部预览时总页数跨文件
+  const t = (PVQ.length ? PV.i + 1 : PV.page) + d;
+  if (t < 1 || t > n) return;
+  if (PVQ.length) PV.i = t - 1;
+  else PV.page = t;
+  loadEffect();
 }
 $('#pvPrev').addEventListener('click', ()=> pvGo(-1));
 $('#pvNext').addEventListener('click', ()=> pvGo(1));
@@ -708,7 +748,7 @@ const WHEEL_COOL = 220;    // 触控板翻页后的冷却，吃掉惯性尾巴
 const WHEEL_COOL_M = 120;  // 鼠标的冷却短一些，连滚可以连着翻
 const GESTURE_GAP = 160;   // 事件间隔超过这个就算新手势
 $('#pvEffect').addEventListener('wheel', e => {
-  if (PV.tab !== 'effect' || PV.pages < 2) return;
+  if (PV.tab !== 'effect' || (PVQ.length || PV.pages) < 2) return;
   if (Math.abs(e.deltaY) <= Math.abs(e.deltaX)) return;   // 横向滑动不翻页
   e.preventDefault();                                     // 别让背景跟着滚
   const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? 400 : 1;
