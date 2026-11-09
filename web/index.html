@@ -88,6 +88,8 @@
   .modal .mbody td:first-child{border-left:0;border-radius:0}
   .modal .mbody td:last-child{border-right:0;border-radius:0}
   .modal .mbody tr:hover td{background:#fafbfd}
+  .pv-sheet{max-width:1100px;height:100%}
+  .pv-sheet iframe{flex:1;width:100%;min-height:0;border:0;background:#f0f2f6}
 </style>
 </head>
 <body>
@@ -154,6 +156,19 @@
       <button class="mini" onclick="closeLog()">关闭</button>
     </div>
     <div class="mbody"><table id="logTable"></table></div>
+  </div>
+</div>
+
+<div class="modal" id="pv">
+  <div class="sheet pv-sheet">
+    <div class="mhead">
+      <b id="pvTitle"></b>
+      <span class="hint" id="pvMeta"></span>
+      <div class="grow"></div>
+      <button class="mini" id="pvTab">新标签打开</button>
+      <button class="mini" onclick="closePv()">关闭</button>
+    </div>
+    <iframe id="pvFrame" title="文件预览"></iframe>
   </div>
 </div>
 
@@ -300,7 +315,8 @@ function render(){
             <option value="long" ${s.duplex==='long'?'selected':''}>双面·长边</option>
             <option value="short" ${s.duplex==='short'?'selected':''}>双面·短边</option></select></td>
       <td><span class="st ${cls}" ${job&&job.msg?`title="${esc(job.msg)}"`:''}>${esc(st)}</span></td>
-      <td><button class="mini" data-act="one">打印</button></td>
+      <td><button class="mini" data-act="pv" ${f.error?'disabled':''}>预览</button>
+          <button class="mini" data-act="one">打印</button></td>
     </tr>`;
   }).join('');
   updateStat();
@@ -418,9 +434,34 @@ $('#tbody').addEventListener('change', e=>{
 });
 
 $('#tbody').addEventListener('click', e=>{
-  if (e.target.dataset.act !== 'one') return;
-  const tr = e.target.closest('tr');
-  send([tr.dataset.n]);
+  const act = e.target.dataset.act, tr = e.target.closest('tr');
+  if (!act || !tr) return;
+  if (act === 'pv') openPv(tr.dataset.n);
+  else if (act === 'one') send([tr.dataset.n]);
+});
+
+// 预览：iframe 直接吃 /pdf/ 返回的可打印 PDF（Office/图片已是转好的缓存），翻页缩放交给浏览器阅读器
+function openPv(name){
+  const f = FILES.find(x=> x.name === name);
+  if (!f) return;
+  if (f.error) return toast('这份文件无法预览：' + f.detail, true);
+  $('#pvTitle').textContent = name;
+  $('#pvMeta').textContent = f.detail || '';
+  $('#pvTab').dataset.n = name;
+  $('#pvFrame').src = '/pdf/' + encodeURIComponent(name);
+  $('#pv').classList.add('show');
+}
+
+function closePv(){
+  $('#pv').classList.remove('show');
+  $('#pvFrame').src = 'about:blank';   // 停掉加载，别让大文件一直占着内存
+}
+
+$('#pv').addEventListener('click', e=>{ if (e.target.id === 'pv') closePv(); });
+$('#pvTab').addEventListener('click', e=>
+  window.open('/pdf/' + encodeURIComponent(e.currentTarget.dataset.n), '_blank'));
+document.addEventListener('keydown', e=>{
+  if (e.key === 'Escape' && $('#pv').classList.contains('show')) closePv();
 });
 
 function toggleAll(v){
