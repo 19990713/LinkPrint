@@ -121,6 +121,11 @@ OFFICE_EXT = set(KIND)
 IMG_EXT = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp", ".gif"}
 CONV_LOCK = threading.Lock()
 
+# 页面缩放：前三档是 SumatraPDF 原生参数；custom 没有原生支持，
+# 先用 PyMuPDF 把页面按比例重排成新 PDF，再按 noscale 打
+SCALE = {"fit": "fit", "shrink": "shrink", "noscale": "noscale", "custom": "noscale"}
+SCALE_LOCK = threading.Lock()
+
 
 def ext_of(p):
     return os.path.splitext(p)[1].lower()
@@ -204,6 +209,65 @@ def printable_pdf(src):
     if not hit:
         raise RuntimeError("转换失败（WPS 没转出 PDF：文件损坏/加密，或 WPS 正弹着对话框）")
     return hit
+
+
+def scaled_target(src, pct):
+    """自定义比例的缓存路径。带上源文件的 mtime+size，源一改缓存自动作废。"""
+    st = os.stat(src)
+    stem = os.path.splitext(os.path.basename(src))[0]
+    return os.path.join(CONV_DIR, f"{stem}_{st.st_size}_{int(st.st_mtime)}_s{int(pct)}.pdf")
+
+
+def scaled_pdf(src, pct):
+    """把 src 的可打印 PDF 按 pct% 精确重排成一份新 PDF，返回缓存路径。
+    重排出来的页面本身已经是 pct% 大小，所以送印时配 noscale。"""
+    pct = int(pct)
+    if not 10 <= pct <= 400:
+        raise ValueError(f"自定义比例需在 10-400%：{pct}")
+    t = scaled_target(src, pct)
+    if os.path.isfile(t) and os.path.getsize(t):
+        return t
+    with SCALE_LOCK:
+        if os.path.isfile(t) and os.path.getsize(t):   # 排队期间别人可能已经做好
+            return t
+        doc = fitz.open(printable_pdf(src))
+        try:
+            if doc.needs_pass:
+                raise RuntimeError("PDF 有密码，无法按比例缩放")
+            if doc.page_count > 2000:
+                raise RuntimeError(f"页数太多（{doc.page_count}），请改用「适合」或「实际大小」")
+            try:
+                # show_pdf_page 只搬页面内容流，不拍平会丢掉注释和表单域
+                doc.bake(annots=True, widgets=True)
+            except Exception:
+                pass
+            k = pct / 100.0
+            out = fitz.open()
+            try:
+                for pg in doc:
+                    np_ = out.new_page(width=pg.rect.width * k, height=pg.rect.height * k)
+                    np_.show_pdf_page(np_.rect, doc, pg.number)   # 矢量缩放，不重采样
+                data = out.tobytes(deflate=True, garbage=3)
+            finally:
+                out.close()
+        finally:
+            doc.close()
+        os.makedirs(CONV_DIR, exist_ok=True)
+        part = t + ".part"          # 半截文件不会被当成有效缓存
+        with open(part, "wb") as f:
+            f.write(data)
+        try:
+            os.replace(part, t)
+        except OSError:             # Sumatra 正读着同名文件时会拒绝替换，已有就复用
+            if not os.path.isfile(t):
+                raise
+        finally:
+            if os.path.exists(part):
+                try:
+                    os.remove(part)
+                except OSError:
+                    pass
+    return t
 
 
 def prune_cache(days=7):
@@ -344,7 +408,10 @@ def build_settings(job):
     # 不传 portrait/landscape：那两个参数只旋转内容、不改纸张方向，会和 SumatraPDF
     # 自带的自动旋转叠加成转两次（横向内容缩成 71% 塞在纵向纸里）。
     # 交给自动旋转：宽于高的页面自动转 90° 适配纸张，满版。
-    s.append("fit")  # 适合纸张：按比例缩放到可打印区域，会缩也会放大
+    mode = job.get("scale", "fit")      # 老调用方不带 scale 时维持原行为
+    s.append(SCALE.get(mode, "fit"))
+    if mode != "fit":
+        s.append("center")              # 内容小于纸面时居中，和 Acrobat 观感一致
     return ",".join(s)
 
 
@@ -433,15 +500,33 @@ def enqueue(items):
         if duplex not in DUPLEX:
             raise ValueError("双面参数非法")
         color = bool(it.get("color"))
+        scale = it.get("scale", "fit")
+        if scale not in SCALE:
+            raise ValueError(f"缩放方式非法: {scale}")
+        pct = 100
+        if scale == "custom":
+            try:
+                pct = int(it.get("scale_pct", 100))
+            except (TypeError, ValueError):
+                raise ValueError("自定义比例必须是整数")
+            if not 10 <= pct <= 400:
+                raise ValueError("自定义比例需在 10-400%")
         info = preflight(path)
         if info.get("error"):
             raise ValueError(f"{os.path.basename(path)}：{info['detail']}")
+        pdf = info["pdf"]
+        if scale == "custom" and pct != 100:
+            try:
+                pdf = scaled_pdf(path, pct)      # 用原始文件算缓存名，源一改自动失效
+            except Exception as e:
+                raise ValueError(f"{os.path.basename(path)}：{e}")
         pages = info["pages"]
         unit = unit_price(paper, color)
         _seq[0] += 1
-        job = {"id": _seq[0], "name": os.path.basename(path), "path": info["pdf"],
+        job = {"id": _seq[0], "name": os.path.basename(path), "path": pdf,
                "printer": printer, "copies": copies, "color": color,
-               "paper": paper, "duplex": duplex, "state": "排队中", "msg": "",
+               "paper": paper, "duplex": duplex, "scale": scale, "pct": pct,
+               "state": "排队中", "msg": "",
                "pages": pages, "unit": unit,
                "amount": round(unit * copies * pages, 2)}
         job["settings"] = build_settings(job)

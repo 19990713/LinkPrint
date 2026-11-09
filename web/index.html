@@ -55,6 +55,12 @@
   tr.row:hover td{background:#fbfcfe}
   .name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block}
   select{max-width:100%}            /* 定宽列里别把下拉框顶出去 */
+  /* 缩放：百分比输入框做成单元格第二行，只在该行选「自定义」时出现，不占列宽 */
+  .scaleCell .c-scale{font-size:12px;padding:5px 2px}
+  .scaleCell .pct{display:none;align-items:center;gap:3px;margin-top:3px;
+                  color:var(--muted);font-size:11px}
+  .scaleCell.on .pct{display:flex}
+  .scaleCell .c-pct{width:52px;padding:3px 4px;font-size:12px}
   .name a{color:var(--text);text-decoration:none;font-weight:500}
   .name a:hover{color:var(--accent);text-decoration:underline}
   .sub{color:var(--muted);font-size:11px;margin-top:1px}
@@ -121,6 +127,15 @@
     <option value="long">双面·长边翻页</option>
     <option value="short">双面·短边翻页</option>
   </select>
+  <label>缩放</label>
+  <select id="dScale">
+    <option value="fit">适合</option>
+    <option value="noscale">实际大小</option>
+    <option value="shrink">缩小过大</option>
+    <option value="custom">自定义</option>
+  </select>
+  <input type="number" id="dPct" value="100" min="10" max="400" title="自定义比例，10-400%">
+  <span class="hint">%</span>
   <button onclick="applyAll()">应用到全部</button>
   <div class="grow"></div>
   <span class="hint" id="stat"></span>
@@ -132,12 +147,12 @@
       <col style="width:36px"><col id="colFile">
       <col style="width:62px"><col id="colSize" style="width:78px"><col style="width:66px">
       <col id="colPrinter"><col style="width:86px"><col style="width:84px">
-      <col style="width:84px"><col style="width:116px"><col style="width:84px"><col><!-- 最后一列吃掉剩余宽度 -->
+      <col style="width:84px"><col style="width:116px"><col style="width:100px"><col style="width:84px"><col><!-- 最后一列吃掉剩余宽度 -->
     </colgroup>
     <thead><tr>
       <th><input type="checkbox" id="chkAll" checked onchange="toggleAll(this.checked)"></th>
       <th class="c-file" title="拖动右边界可调宽">文件</th><th>页数</th><th>尺寸</th><th>方向</th>
-      <th>打印机</th><th>份数</th><th>色彩</th><th>纸张</th><th>双面方式</th><th>状态</th><th></th>
+      <th>打印机</th><th>份数</th><th>色彩</th><th>纸张</th><th>双面方式</th><th>缩放</th><th>状态</th><th></th>
     </tr></thead>
     <tbody id="tbody"></tbody>
   </table>
@@ -188,11 +203,11 @@
 <script>
 let CFG = {folder:'', printers:[], papers:[]};
 let FILES = [];
-let ROWS = {};       // name -> {sel, printer, copies, color, paper, duplex}
+let ROWS = {};       // name -> {sel, printer, copies, color, paper, duplex, scale, pct}
 let LASTJOB = {};    // name -> job
 let PREV = {};       // job id -> 上次看到的状态
 let SIG = '';
-let DEF = {printer:'', copies:1, color:0, paper:'A4', duplex:'single'};
+let DEF = {printer:'', copies:1, color:0, paper:'A4', duplex:'single', scale:'fit', pct:100};
 
 const $ = s => document.querySelector(s);
 const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -231,7 +246,9 @@ function barValues(){
     copies: Math.max(1, parseInt($('#dCopies').value) || 1),
     color: +$('#dColor').value,
     paper: $('#dPaper').value,
-    duplex: $('#dDuplex').value
+    duplex: $('#dDuplex').value,
+    scale: $('#dScale').value,
+    pct: Math.min(400, Math.max(10, parseInt($('#dPct').value) || 100))
   };
 }
 
@@ -263,7 +280,9 @@ async function refresh(fresh){
         copies: DEF.copies,
         color: DEF.color,
         paper: f.paper || 'A4',
-        duplex: DEF.duplex
+        duplex: DEF.duplex,
+        scale: DEF.scale,
+        pct: DEF.pct
       };
     }
     const s = ROWS[f.name];
@@ -271,6 +290,8 @@ async function refresh(fresh){
     if (!CFG.printers.includes(s.printer)) s.printer = DEF.printer;
     if (!CFG.papers.includes(s.paper)) s.paper = f.paper || 'A4';
     if (!isColorMachine(s.printer)) s.color = 0;   // 黑白机没有彩色，避免按彩色计价
+    if (!(s.scale in {fit:1, shrink:1, noscale:1, custom:1})) s.scale = 'fit';
+    s.pct = Math.min(400, Math.max(10, parseInt(s.pct) || 100));
   }
   for (const k of Object.keys(ROWS)) if (!seen.has(k)) delete ROWS[k];
   const sg = FILES.map(f=>f.name + '@' + f.mtime).join('|')
@@ -325,6 +346,14 @@ function render(){
             <option value="single" ${s.duplex==='single'?'selected':''}>单面</option>
             <option value="long" ${s.duplex==='long'?'selected':''}>双面·长边</option>
             <option value="short" ${s.duplex==='short'?'selected':''}>双面·短边</option></select></td>
+      <td class="scaleCell ${s.scale==='custom'?'on':''}">
+        <select class="c-scale">
+          <option value="fit" ${s.scale==='fit'?'selected':''}>适合</option>
+          <option value="noscale" ${s.scale==='noscale'?'selected':''}>实际大小</option>
+          <option value="shrink" ${s.scale==='shrink'?'selected':''}>缩小过大</option>
+          <option value="custom" ${s.scale==='custom'?'selected':''}>自定义</option></select>
+        <span class="pct"><input type="number" class="c-pct" min="10" max="400" value="${s.pct}">%</span>
+      </td>
       <td><span class="st ${cls}" ${job&&job.msg?`title="${esc(job.msg)}"`:''}>${esc(st)}</span></td>
       <td><button class="mini" data-act="pv" ${f.error?'disabled':''}>预览</button>
           <button class="mini" data-act="one">打印</button></td>
@@ -504,6 +533,14 @@ $('#tbody').addEventListener('change', e=>{
   else if (e.target.classList.contains('c-color')) s.color = +e.target.value;
   else if (e.target.classList.contains('c-paper')) s.paper = e.target.value;
   else if (e.target.classList.contains('c-duplex')) s.duplex = e.target.value;
+  else if (e.target.classList.contains('c-scale')){
+    s.scale = e.target.value;
+    e.target.closest('td').classList.toggle('on', s.scale === 'custom');  // 只展开本行，不重建表格
+  }
+  else if (e.target.classList.contains('c-pct')){
+    const v = Math.min(400, Math.max(10, parseInt(e.target.value) || 100));
+    e.target.value = v; s.pct = v;
+  }
   updateStat();
 });
 
@@ -549,6 +586,7 @@ function applyAll(){
     const s = ROWS[f.name];
     s.printer = DEF.printer; s.copies = DEF.copies;
     s.paper = DEF.paper; s.duplex = DEF.duplex;
+    s.scale = DEF.scale; s.pct = DEF.pct;
     s.color = DEF.color;
   }
   render();
@@ -559,7 +597,8 @@ async function send(names){
   const jobs = names.map(n=>{
     const s = ROWS[n];
     return {name:n, printer:s.printer, copies:s.copies,
-            color: !!s.color, paper:s.paper, duplex:s.duplex};
+            color: !!s.color, paper:s.paper, duplex:s.duplex,
+            scale: s.scale, scale_pct: s.pct};
   });
   try{
     const r = await fetch('/api/print', {method:'POST', headers:{'Content-Type':'application/json'},

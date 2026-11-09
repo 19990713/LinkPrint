@@ -16,11 +16,18 @@ assert ps.classify(213, 303) == "A4"      # 带出血的 A4
 assert ps.classify(200, 300) is None      # 非标
 print("纸型识别 OK")
 
-# 打印参数串（不能带 portrait/landscape，否则和自动旋转叠加转两次；缩放用 fit 适合纸张）
+# 打印参数串（不能带 portrait/landscape，否则和自动旋转叠加转两次；缩放默认 fit 适合纸张）
 j = {"copies": 2, "duplex": "short", "color": False, "paper": "A4"}
-assert ps.build_settings(j) == "2x,duplexshort,monochrome,paper=A4,fit"
+assert ps.build_settings(j) == "2x,duplexshort,monochrome,paperkind=9,fit"
 j.update(duplex="long", color=True)
-assert ps.build_settings(j) == "2x,duplexlong,color,paper=A4,fit"
+assert ps.build_settings(j) == "2x,duplexlong,color,paperkind=9,fit"
+# 缩放四档：fit 不加 center，其余三档加（内容小于纸面时居中）
+j.update(scale="shrink")
+assert ps.build_settings(j) == "2x,duplexlong,color,paperkind=9,shrink,center"
+j.update(scale="noscale")
+assert ps.build_settings(j) == "2x,duplexlong,color,paperkind=9,noscale,center"
+j.update(scale="custom", pct=85)
+assert ps.build_settings(j) == "2x,duplexlong,color,paperkind=9,noscale,center"
 print("打印参数 OK")
 
 # 计费：A4 黑白 0.5 / 彩色 2，A3 翻倍
@@ -106,6 +113,30 @@ finally:
     os.remove(png)
     if os.path.isfile(ip):
         os.remove(ip)
+
+# ---------------- 自定义比例缩放 ----------------
+sp = ""
+try:
+    src_pdf = files[0]
+    try:
+        ps.scaled_pdf(src_pdf, 5)
+        raise AssertionError("比例超范围应该报错")
+    except ValueError:
+        pass
+    sp = ps.scaled_pdf(src_pdf, 85)
+    a, b = fitz.open(src_pdf), fitz.open(sp)
+    try:
+        assert len(b) == len(a), "缩放后页数不能变"
+        for i in range(len(a)):
+            assert abs(b[i].rect.width / a[i].rect.width - 0.85) < 1e-3, i
+    finally:
+        a.close()
+        b.close()
+    assert ps.scaled_pdf(src_pdf, 85) == sp, "第二次应命中缩放缓存"
+    print(f"自定义比例 OK  85% -> {os.path.basename(sp)}")
+finally:
+    if sp and os.path.isfile(sp):
+        os.remove(sp)
 
 # ---------------- 切换热文件夹 ----------------
 import json
