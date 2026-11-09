@@ -1,0 +1,85 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="cmyk" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#00baff"/><stop offset="0.14" stop-color="#01a1fd"/>
+      <stop offset="0.30" stop-color="#3e7efa"/><stop offset="0.37" stop-color="#6a63f1"/>
+      <stop offset="0.45" stop-color="#ce43cc"/><stop offset="0.51" stop-color="#f037af"/>
+      <stop offset="0.56" stop-color="#fd3b94"/><stop offset="0.66" stop-color="#fe635d"/>
+      <stop offset="0.71" stop-color="#fe8245"/><stop offset="0.76" stop-color="#fda131"/>
+      <stop offset="0.81" stop-color="#ffb82a"/><stop offset="0.91" stop-color="#fed530"/>
+      <stop offset="1" stop-color="#ffe63c"/>
+    </linearGradient>
+    <linearGradient id="fold" x1="0.55" y1="0" x2="0.2" y2="1">
+      <stop offset="0" stop-color="#c7ccd7"/><stop offset="0.62" stop-color="#d6dae4"/>
+      <stop offset="1" stop-color="#edeef4"/>
+    </linearGradient>
+    <linearGradient id="lip" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#000000" stop-opacity="0.45"/>
+      <stop offset="1" stop-color="#000000" stop-opacity="0"/>
+    </linearGradient>
+    <filter id="sh" x="-30%" y="-25%" width="160%" height="170%">
+      <feDropShadow dx="0" dy="6" stdDeviation="20" flood-color="#22305c" flood-opacity="0.7"/>
+    </filter>
+    <clipPath id="sheetClip"><path d="M144 287H369L414 397Q416 403 410 403H97Q91 403 93 397Z"/></clipPath>
+  </defs>
+
+  <rect width="512" height="512" rx="112" fill="#ffffff"/>
+  <rect x="0.8" y="0.8" width="510.4" height="510.4" rx="111" fill="none"
+        stroke="#f1f3f7" stroke-width="1.4"/>
+
+  <!-- 内容整体坐标校正：量测是在“旧裁切框”里做的，旧框比白砖多留了下边 ~15px，
+       这里把内容映射回真正的白砖坐标（横向 -0.27%，纵向 +1.35%） -->
+  <g transform="translate(0.959 0.487) scale(0.99726 1.01346)">
+
+  <!-- 机身 -->
+  <path d="M97.0 193.0H415.0A39.0 39.0 0 0 1 454.0 232.0V296.0
+           A39.0 39.0 0 0 1 415.0 335.0H97.0A39.0 39.0 0 0 1 58.0 296.0
+           V232.0A39.0 39.0 0 0 1 97.0 193.0Z" fill="#1a1a20"/>
+
+  <!-- 上盖与机身之间的白缝：中段等宽，两端顺肩线向下垂落成带圆头的细尾 -->
+  <path d="M83.4 236.4
+          C83.9 226.6 92.0 217.6 108.0 217.6
+          H412
+          C419.6 219.2 425.8 224.8 427.2 230.8
+          A1.1 1.1 0 0 1 426.0 232.3
+          C423.8 230.0 419.2 227.6 415.0 227.6
+          H109
+          C96.0 227.6 86.4 229.4 84.2 237.6
+          A1.7 1.7 0 0 0 83.4 236.4
+          Z" fill="#ffffff"/>
+
+  <!-- 指示灯 -->
+  <circle cx="411.0" cy="254.0" r="10.0" fill="#ffffff"/>
+
+  <!-- 纸张白底：下缘与白缝下沿齐平，白色连成一片 -->
+  <path d="M123.0 227.4V105.5
+           A20.0 20.0 0 0 1 143.0 85.5
+           H308.0L375.0 150.5V227.4Z" fill="#ffffff"/>
+
+  <!-- 折角：压在折痕内侧，先画，随后纸的描边会盖住它的斜边，接缝不留白 -->
+  <path d="M308.5 136.5V85.5L376 152.4H321C316.2 152.4 310.6 148.4 308.5 136.5Z" fill="url(#fold)"/>
+
+  <!-- 纸的描边：左、顶、折痕、右（底边不描边，止于白缝上沿） -->
+  <path d="M123.0 217.6V105.5
+           A20.0 20.0 0 0 1 143.0 85.5
+           H308.0L375.0 150.5V217.6"
+        fill="none" stroke="#1a1a20" stroke-width="13.5"
+        stroke-linejoin="round" stroke-linecap="butt"/>
+
+  <!-- Link -->
+  <path d="M157.6 201.4V139.35H169.11V191.62H198.41V201.4ZM211.83 138.46Q214.48 138.46 216.36 140.26Q218.25 142.06 218.25 144.6Q218.25 147.15 216.36 148.95Q214.48 150.75 211.83 150.75Q209.17 150.75 207.29 148.95Q205.41 147.15 205.41 144.6Q205.41 142.06 207.29 140.26Q209.17 138.46 211.83 138.46ZM206.12 201.4V164.72H200.06V156.04H217.32V201.4ZM256.81 201.4V175.18Q256.81 169.38 254.48 166.71Q252.16 164.04 246.89 164.04Q244.46 164.04 241.69 165.36Q238.93 166.67 237.38 168.62V201.4H226.31V156.04H234.28L236.31 160.28Q240.83 155.19 249.64 155.19Q258.09 155.19 262.98 160.04Q267.87 164.89 267.87 173.57V201.4ZM306.26 201.4 292.31 180.86 287 186.24V201.4H275.94V139.14L287 136.6V173.45L302.8 156.04H316.12L300.1 173.24L319.4 201.4Z" fill="#1a1a20" stroke="#1a1a20" stroke-width="3.2"
+        stroke-linejoin="round"/>
+  <!-- CMYK 出纸 -->
+  <g filter="url(#sh)"><path d="M144 287H369L414 397Q416 403 410 403H97Q91 403 93 397Z" fill="#ffffff"/></g>
+  <path d="M157 288H356L389 386Q391 390 386 390H108Q103 390 105 386Z" fill="url(#cmyk)"/>
+  <rect x="60" y="286" width="392" height="8" fill="url(#lip)" clip-path="url(#sheetClip)"/>
+
+  <!-- 右上三条彩线 -->
+  <g stroke-linecap="round" fill="none">
+    <path d="M395.8 120.0L405.6 89.0" stroke="#019bfd" stroke-width="18.5"/>
+    <path d="M420.6 138.0L448.6 113.8" stroke="#fc2074" stroke-width="18.5"/>
+    <path d="M433.7 165.1L464.3 158.5" stroke="#fec105" stroke-width="18.5"/>
+  </g>
+
+  </g>
+</svg>

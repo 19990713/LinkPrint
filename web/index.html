@@ -1,0 +1,504 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>LinkPrint 打印系统</title>
+<link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+<link rel="icon" href="icons/favicon.ico" sizes="any">
+<link rel="apple-touch-icon" href="icons/icon-256.png">
+<style>
+  :root{
+    --bg:#f4f6f9; --card:#fff; --line:#e4e8ef; --text:#1f2532; --muted:#6d7686;
+    --accent:#2f5bea; --accent-soft:#eaeffe;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);
+       font:13px/1.5 "Microsoft YaHei",system-ui,-apple-system,"Segoe UI",sans-serif}
+  header{display:flex;align-items:center;gap:16px;padding:12px 18px;background:var(--card);
+         border-bottom:1px solid var(--line);position:sticky;top:0;z-index:20}
+  h1{margin:0;font-size:15px;letter-spacing:.3px}
+  h1 span{color:var(--accent)}
+  .folder{color:var(--muted);font-size:12px;max-width:44vw;overflow:hidden;
+          text-overflow:ellipsis;white-space:nowrap;direction:rtl;text-align:left}
+  .grow{flex:1}
+  button{font:inherit;border:1px solid var(--line);background:var(--card);color:var(--text);
+         border-radius:7px;padding:6px 12px;cursor:pointer;transition:.15s}
+  button:hover{border-color:#c6cfdd;background:#fafbfd}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600;padding:8px 18px}
+  button.primary:hover{background:#2549c9}
+  button.primary:disabled{background:#b9c4de;border-color:#b9c4de;cursor:not-allowed}
+  button.mini{padding:3px 9px;font-size:12px;border-radius:6px}
+
+  .bar{display:flex;flex-wrap:wrap;align-items:center;gap:10px;padding:10px 18px;
+       background:var(--card);border-bottom:1px solid var(--line)}
+  .bar label{color:var(--muted);font-size:12px}
+  .bar .tag{background:var(--accent-soft);color:var(--accent);font-weight:600;
+            padding:3px 9px;border-radius:6px;font-size:12px}
+  select,input[type=number]{font:inherit;padding:5px 7px;border:1px solid var(--line);
+       border-radius:6px;background:#fff;color:var(--text);outline:none}
+  select:focus,input:focus{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent-soft)}
+  select:disabled{background:#f3f4f7;color:#8b93a3;border-color:#eef1f6;cursor:not-allowed}
+  input[type=number]{width:66px;text-align:center}
+
+  .wrap{padding:0 18px 90px}
+  table{width:100%;border-collapse:separate;border-spacing:0 6px}
+  th{font-size:12px;color:var(--muted);font-weight:500;text-align:left;padding:6px 10px;white-space:nowrap}
+  td{background:var(--card);padding:7px 10px;border-top:1px solid var(--line);
+     border-bottom:1px solid var(--line);white-space:nowrap}
+  td:first-child{border-left:1px solid var(--line);border-radius:8px 0 0 8px}
+  td:last-child{border-right:1px solid var(--line);border-radius:0 8px 8px 0}
+  tr.row:hover td{background:#fbfcfe}
+  .name{max-width:30vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block}
+  td.c-file{width:100%}
+  .name a{color:var(--text);text-decoration:none;font-weight:500}
+  .name a:hover{color:var(--accent);text-decoration:underline}
+  .sub{color:var(--muted);font-size:11px;margin-top:1px}
+  .badge{display:inline-block;padding:2px 8px;border-radius:5px;background:#eef1f6;
+         font-weight:600;font-size:12px}
+  .badge.ok{background:var(--accent-soft);color:var(--accent)}
+  .mix{color:#b26b00;background:#fff4e0}
+  .st{display:inline-block;padding:2px 9px;border-radius:11px;font-size:12px;background:#eef1f6;color:#5a6373}
+  .st.doing{background:#e8f0ff;color:#2f5bea}
+  .st.done{background:#e6f6ec;color:#17864a}
+  .st.err{background:#fdeaea;color:#c62828}
+  .empty{padding:60px;text-align:center;color:var(--muted)}
+  .footer{position:fixed;bottom:0;left:0;right:0;display:flex;align-items:center;gap:14px;
+          padding:11px 18px;background:var(--card);border-top:1px solid var(--line);
+          box-shadow:0 -2px 12px rgba(30,40,60,.05)}
+  .hint{color:var(--muted);font-size:12px}
+  .toast{position:fixed;left:50%;bottom:80px;transform:translateX(-50%);background:#1f2532;color:#fff;
+         padding:10px 20px;border-radius:9px;font-size:13px;opacity:0;transition:.25s;pointer-events:none;z-index:99}
+  .toast.show{opacity:1}
+  .toast.bad{background:#c62828}
+
+  .money{font-size:12px;font-weight:600;color:#17864a;background:#e6f6ec;
+         padding:3px 9px;border-radius:6px;white-space:nowrap}
+  .modal{position:fixed;inset:0;background:rgba(22,28,42,.42);display:none;padding:40px 20px;z-index:100}
+  .modal.show{display:flex}
+  .sheet{background:#fff;border-radius:12px;width:100%;max-width:960px;margin:auto;
+         display:flex;flex-direction:column;max-height:100%;overflow:hidden;
+         box-shadow:0 18px 50px rgba(20,30,60,.25)}
+  .mhead{display:flex;align-items:center;gap:12px;padding:14px 18px;border-bottom:1px solid var(--line)}
+  .mbody{overflow:auto;padding:0 18px}
+  .modal .mbody table{width:100%;border-collapse:collapse;border-spacing:0}
+  .modal .mbody th{position:sticky;top:0;background:#fff;z-index:1;padding:8px 6px;
+                   border-bottom:1px solid var(--line);font-size:12px;color:var(--muted);font-weight:500}
+  .modal .mbody td{padding:7px 6px;border:0;border-bottom:1px solid var(--line);border-radius:0;
+                   background:transparent;font-size:12px;white-space:nowrap}
+  .modal .mbody td:first-child{border-left:0;border-radius:0}
+  .modal .mbody td:last-child{border-right:0;border-radius:0}
+  .modal .mbody tr:hover td{background:#fafbfd}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Link<span>Print</span> 打印系统</h1>
+  <div class="folder" id="folder">—</div>
+  <button class="mini" onclick="pickFolder()">更换文件夹</button>
+  <button class="mini" onclick="openFolder()">打开文件夹</button>
+  <div class="grow"></div>
+  <button onclick="refresh(true)">刷新</button>
+  <button class="primary" id="btnAll" onclick="printAll()">全部发出打印</button>
+</header>
+
+<div class="bar">
+  <span class="tag">默认设置</span>
+  <label>打印机</label><select id="dPrinter"></select>
+  <label>份数</label><input type="number" id="dCopies" value="1" min="1" max="999">
+  <label>色彩</label><select id="dColor"><option value="0">黑白</option><option value="1">彩色</option></select>
+  <label>纸张</label><select id="dPaper"></select>
+  <label>双面</label>
+  <select id="dDuplex">
+    <option value="single">单面</option>
+    <option value="long">双面·长边翻页</option>
+    <option value="short">双面·短边翻页</option>
+  </select>
+  <button onclick="applyAll()">应用到全部</button>
+  <div class="grow"></div>
+  <span class="hint" id="stat"></span>
+</div>
+
+<div class="wrap">
+  <table>
+    <thead><tr>
+      <th style="width:30px"><input type="checkbox" id="chkAll" checked onchange="toggleAll(this.checked)"></th>
+      <th>文件</th><th>页数</th><th>尺寸</th><th>方向</th>
+      <th>打印机</th><th>份数</th><th>色彩</th><th>纸张</th><th>双面方式</th><th>状态</th><th></th>
+    </tr></thead>
+    <tbody id="tbody"></tbody>
+  </table>
+  <div class="empty" id="empty" style="display:none">
+    热文件夹里还没有文件。把 PDF / Word / 表格 / PPT / 图片 拖进热文件夹即可自动出现（Office 和图片会自动转成 PDF）。
+  </div>
+</div>
+
+<div class="footer">
+  <span class="hint" id="selInfo">—</span>
+  <span class="money" id="mToday">今日 ¥0.00</span>
+  <span class="money" id="mTotal">累计 ¥0.00</span>
+  <button class="mini" onclick="openLog()">打印记录</button>
+  <div class="grow"></div>
+  <span class="hint">勾选后一次性发出，队列按顺序送印</span>
+  <button class="primary" onclick="printAll()">发出打印</button>
+</div>
+
+<div class="modal" id="modal">
+  <div class="sheet">
+    <div class="mhead">
+      <b>打印记录</b>
+      <span class="hint" id="mSum"></span>
+      <div class="grow"></div>
+      <button class="mini" onclick="clearLog()" title="只清屏幕上的记录和今日/累计，打印记录.csv 不动">清空显示</button>
+      <button class="mini" id="btnAllLog" onclick="showAllLog()" style="display:none">显示全部</button>
+      <button class="mini" onclick="closeLog()">关闭</button>
+    </div>
+    <div class="mbody"><table id="logTable"></table></div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+let CFG = {folder:'', printers:[], papers:[]};
+let FILES = [];
+let ROWS = {};       // name -> {sel, printer, copies, color, paper, duplex}
+let LASTJOB = {};    // name -> job
+let PREV = {};       // job id -> 上次看到的状态
+let SIG = '';
+let DEF = {printer:'', copies:1, color:0, paper:'A4', duplex:'single'};
+
+const $ = s => document.querySelector(s);
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+function toast(msg, bad){
+  const t = $('#toast');
+  t.textContent = msg;
+  t.className = 'toast show' + (bad ? ' bad' : '');
+  clearTimeout(t._t);
+  t._t = setTimeout(()=> t.className = 'toast', 2600);
+}
+
+function isColorMachine(p){ return /彩|C7580/i.test(p); }
+
+// 黑白机只给「黑白」一项，彩机才给黑白/彩色两个选项
+function colorSelect(s){
+  if (!isColorMachine(s.printer))
+    return `<select class="c-color" disabled><option value="0">黑白</option></select>`;
+  return `<select class="c-color">
+    <option value="0" ${s.color?'':'selected'}>黑白</option>
+    <option value="1" ${s.color?'selected':''}>彩色</option></select>`;
+}
+
+function setColorOptions(sel, isColor, val){
+  sel.innerHTML = isColor
+    ? '<option value="0">黑白</option><option value="1">彩色</option>'
+    : '<option value="0">黑白</option>';
+  sel.disabled = !isColor;
+  sel.value = isColor && val ? '1' : '0';
+}
+
+// 默认设置工具条的当前值，新增文件和「应用到全部」都用它
+function barValues(){
+  return {
+    printer: $('#dPrinter').value,
+    copies: Math.max(1, parseInt($('#dCopies').value) || 1),
+    color: +$('#dColor').value,
+    paper: $('#dPaper').value,
+    duplex: $('#dDuplex').value
+  };
+}
+
+// 选彩机就自动带出彩色，选黑白机就自动带出黑白
+$('#dPrinter').addEventListener('change', e=>{
+  const isC = isColorMachine(e.target.value);
+  setColorOptions($('#dColor'), isC, isC ? 1 : 0);
+});
+
+async function refresh(fresh){
+  const r = await fetch('/api/files').then(r=>r.json());
+  const first = !CFG.folder;
+  CFG = r;
+  $('#folder').textContent = r.folder;
+  $('#folder').title = r.folder;
+
+  if (!DEF.printer && r.printers.length) DEF.printer = r.printers[0];
+  if (first) fillSelects();
+  DEF = barValues();
+  FILES = r.files;
+
+  const seen = new Set();
+  for (const f of FILES){
+    seen.add(f.name);
+    if (!ROWS[f.name]){
+      ROWS[f.name] = {
+        sel:true,
+        printer: DEF.printer,
+        copies: DEF.copies,
+        color: DEF.color,
+        paper: f.paper || 'A4',
+        duplex: DEF.duplex
+      };
+    }
+    const s = ROWS[f.name];
+    // 机器/纸张列表变了（比如换打印机），行里存的旧值要回落到合法值
+    if (!CFG.printers.includes(s.printer)) s.printer = DEF.printer;
+    if (!CFG.papers.includes(s.paper)) s.paper = f.paper || 'A4';
+    if (!isColorMachine(s.printer)) s.color = 0;   // 黑白机没有彩色，避免按彩色计价
+  }
+  for (const k of Object.keys(ROWS)) if (!seen.has(k)) delete ROWS[k];
+  const sg = FILES.map(f=>f.name + '@' + f.mtime).join('|')
+           + '#' + CFG.printers.join(',') + '#' + CFG.papers.join(',');
+  if (sg === SIG) paintStatus();          // 文件没变就只刷状态，别冲掉正在输入的控件
+  else { SIG = sg; render(); }
+}
+
+function paintStatus(){
+  document.querySelectorAll('#tbody tr.row').forEach(tr=>{
+    const j = LASTJOB[tr.dataset.n];
+    const st = j ? j.state : '—';
+    const cls = (st==='打印中'||st==='排队中') ? 'doing' : st==='完成' ? 'done' : st==='失败' ? 'err' : '';
+    const el = tr.querySelector('.st');
+    el.className = 'st ' + cls;
+    el.textContent = st;
+    el.title = (j && j.msg) || '';
+  });
+}
+
+function fillSelects(){
+  $('#dPrinter').innerHTML = CFG.printers.map(p=>`<option>${esc(p)}</option>`).join('');
+  $('#dPaper').innerHTML = CFG.papers.map(p=>`<option>${p}</option>`).join('');
+  $('#dPrinter').value = DEF.printer;
+  $('#dPaper').value = 'A4';
+  setColorOptions($('#dColor'), isColorMachine(DEF.printer), DEF.color);
+}
+
+function render(){
+  const tb = $('#tbody');
+  $('#empty').style.display = FILES.length ? 'none' : 'block';
+  tb.innerHTML = FILES.map(f=>{
+    const s = ROWS[f.name];
+    const job = LASTJOB[f.name];
+    const st = job ? job.state : '—';
+    const cls = st==='打印中'||st==='排队中' ? 'doing' : st==='完成' ? 'done' : st==='失败' ? 'err' : '';
+    const orient = f.orientation;
+    return `<tr class="row" data-n="${esc(f.name)}">
+      <td><input type="checkbox" class="c-sel" ${s.sel?'checked':''}></td>
+      <td class="c-file">
+        <span class="name"><a href="/pdf/${encodeURIComponent(f.name)}" target="_blank" title="${esc(f.detail)}">${esc(f.name)}</a></span>
+        <div class="sub">${f.mb} MB${f.kind ? ' · ' + f.kind + ' 转 PDF' : ''}</div>
+      </td>
+      <td><b>${f.pages}</b></td>
+      <td><span class="badge ${f.size==='混合'?'mix':''}" title="${esc(f.detail)}">${esc(f.size)}</span></td>
+      <td>${orient==='混合' ? `<span class="badge mix" title="${esc(f.detail)}">混合</span>` : esc(orient)}</td>
+      <td><select class="c-printer">${CFG.printers.map(p=>`<option ${p===s.printer?'selected':''}>${esc(p)}</option>`).join('')}</select></td>
+      <td><input type="number" class="c-copies" min="1" max="999" value="${s.copies}"></td>
+      <td>${colorSelect(s)}</td>
+      <td><select class="c-paper">${CFG.papers.map(p=>`<option ${p===s.paper?'selected':''}>${p}</option>`).join('')}</select></td>
+      <td><select class="c-duplex">
+            <option value="single" ${s.duplex==='single'?'selected':''}>单面</option>
+            <option value="long" ${s.duplex==='long'?'selected':''}>双面·长边</option>
+            <option value="short" ${s.duplex==='short'?'selected':''}>双面·短边</option></select></td>
+      <td><span class="st ${cls}" ${job&&job.msg?`title="${esc(job.msg)}"`:''}>${esc(st)}</span></td>
+      <td><button class="mini" data-act="one">打印</button></td>
+    </tr>`;
+  }).join('');
+  updateStat();
+}
+
+function amount(f, s){
+  const u = (CFG.prices || {})[s.paper + '|' + (s.color ? 1 : 0)] || 0;
+  return u * (f.pages || 0) * s.copies;
+}
+
+function updateStat(){
+  const sel = FILES.filter(f=>ROWS[f.name].sel);
+  const copies = sel.reduce((a,f)=>a + ROWS[f.name].copies, 0);
+  const money = sel.reduce((a,f)=>a + amount(f, ROWS[f.name]), 0);
+  $('#selInfo').textContent = `已选 ${sel.length} 个文件 · ${copies} 份 · 本次 ¥${money.toFixed(2)}`;
+  $('#stat').textContent = `共 ${FILES.length} 个文件`;
+  $('#btnAll').disabled = !sel.length;
+  const all = FILES.length && FILES.every(f=>ROWS[f.name].sel);
+  $('#chkAll').checked = !!all;
+}
+
+// ---------------- 计费记录 ----------------
+let LOG = {rows:[], today:0, total:0, count:0};
+// 清空显示的时间点：只显示比它新的记录。存在浏览器里，刷新也不会把清掉的又刷回来；
+// 后端 打印记录.csv 一个字不动。
+let MARK = localStorage.getItem('lp_mark') || '';
+
+// 屏幕上该显示什么（MARK 之后的记录才算）。shortcut: 按秒比较，
+// 同一秒里又打完一单会被一起藏掉，等到下一单才看得见
+function viewLog(){
+  const rows = MARK ? LOG.rows.filter(r => (r['时间']||'') > MARK) : LOG.rows;
+  const d = new Date(), pad = n => String(n).padStart(2, '0');
+  const today = `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
+  const sum = a => a.reduce((s, r) => s + (parseFloat(r['金额元']) || 0), 0);
+  return {rows, count: rows.length,
+          today: sum(rows.filter(r => (r['时间']||'').startsWith(today))),
+          total: sum(rows)};
+}
+
+function paintMoney(){
+  const v = viewLog();
+  $('#mToday').textContent = '今日 ¥' + v.today.toFixed(2);
+  $('#mTotal').textContent = '累计 ¥' + v.total.toFixed(2);
+}
+
+async function loadLog(){
+  try{
+    LOG = await fetch('/api/log').then(r=>r.json());
+    paintMoney();
+    if ($('#modal').classList.contains('show')) renderLog();
+  }catch(e){}
+}
+
+function renderLog(){
+  const v = viewLog();
+  $('#mSum').textContent =
+    `共 ${v.count} 单 · 今日 ¥${v.today.toFixed(2)} · 累计 ¥${v.total.toFixed(2)}`;
+  $('#btnAllLog').style.display = MARK ? '' : 'none';   // 清空过才给「显示全部」
+  if (!v.rows.length){
+    $('#logTable').innerHTML = `<tr><td style="padding:36px;text-align:center;color:#6d7686">` +
+      `${MARK ? '显示已清空（打印记录.csv 里还在）' : '还没有打印记录'}</td></tr>`;
+    return;
+  }
+  $('#logTable').innerHTML =
+    `<thead><tr><th>时间</th><th>文件</th><th>页数</th><th>份数</th><th>纸张</th>
+       <th>色彩</th><th>打印机</th><th>单价</th><th>金额</th></tr></thead><tbody>` +
+    v.rows.map(r=>`<tr>
+      <td>${esc((r['时间']||'').slice(5,16))}</td>
+      <td style="max-width:320px;overflow:hidden;text-overflow:ellipsis">${esc(r['文件']||'')}</td>
+      <td>${r['页数']}</td><td>${r['份数']}</td><td>${r['纸张']}</td><td>${r['色彩']}</td>
+      <td>${esc(r['打印机']||'')}</td><td>${r['单价元/页']}</td>
+      <td><b>¥${r['金额元']}</b></td>
+    </tr>`).join('') + '</tbody>';
+}
+
+// 清掉屏幕上的记录与今日/累计（CSV 不动）
+function clearLog(){
+  const newest = (LOG.rows[0] || {})['时间'];
+  if (!newest) return toast('本来就没有记录');
+  MARK = newest;
+  localStorage.setItem('lp_mark', MARK);
+  paintMoney(); renderLog();
+  toast('屏幕已清空，打印记录.csv 未改动');
+}
+
+function showAllLog(){
+  MARK = '';
+  localStorage.removeItem('lp_mark');
+  paintMoney(); renderLog();
+  toast('已显示全部记录');
+}
+
+function openLog(){ $('#modal').classList.add('show'); renderLog(); loadLog(); }
+function closeLog(){ $('#modal').classList.remove('show'); }
+$('#modal').addEventListener('click', e=>{ if (e.target.id === 'modal') closeLog(); });
+
+// 单元格改动
+$('#tbody').addEventListener('change', e=>{
+  const tr = e.target.closest('tr'); if (!tr) return;
+  const s = ROWS[tr.dataset.n]; if (!s) return;
+  if (e.target.classList.contains('c-sel')) s.sel = e.target.checked;
+  else if (e.target.classList.contains('c-printer')){
+    s.printer = e.target.value;
+    s.color = isColorMachine(s.printer) ? 1 : 0;
+    tr.querySelector('.c-color').parentElement.innerHTML = colorSelect(s);  // 黑白机/彩机选项不同，整格重画
+  }
+  else if (e.target.classList.contains('c-copies')){
+    let v = parseInt(e.target.value) || 1;
+    v = Math.min(999, Math.max(1, v)); e.target.value = v; s.copies = v;
+  }
+  else if (e.target.classList.contains('c-color')) s.color = +e.target.value;
+  else if (e.target.classList.contains('c-paper')) s.paper = e.target.value;
+  else if (e.target.classList.contains('c-duplex')) s.duplex = e.target.value;
+  updateStat();
+});
+
+$('#tbody').addEventListener('click', e=>{
+  if (e.target.dataset.act !== 'one') return;
+  const tr = e.target.closest('tr');
+  send([tr.dataset.n]);
+});
+
+function toggleAll(v){
+  for (const f of FILES) ROWS[f.name].sel = v;
+  render();
+}
+
+function applyAll(){
+  DEF = barValues();
+  for (const f of FILES){
+    const s = ROWS[f.name];
+    s.printer = DEF.printer; s.copies = DEF.copies;
+    s.paper = DEF.paper; s.duplex = DEF.duplex;
+    s.color = DEF.color;
+  }
+  render();
+  toast('已应用默认设置到全部文件');
+}
+
+async function send(names){
+  const jobs = names.map(n=>{
+    const s = ROWS[n];
+    return {name:n, printer:s.printer, copies:s.copies,
+            color: !!s.color, paper:s.paper, duplex:s.duplex};
+  });
+  try{
+    const r = await fetch('/api/print', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({jobs})}).then(r=>r.json());
+    if (r.error) return toast('发出失败：' + r.error, true);
+    toast(`已发出 ${r.queued.length} 个打印任务`);
+    poll();
+  }catch(err){ toast('发出失败：' + err, true); }
+}
+
+function printAll(){
+  const names = FILES.filter(f=>ROWS[f.name].sel).map(f=>f.name);
+  if (!names.length) return toast('没有勾选文件', true);
+  send(names);
+}
+
+async function openFolder(){ await fetch('/api/open-folder'); }
+
+async function pickFolder(){
+  toast('请在弹出的窗口里选择文件夹…');
+  try{
+    const r = await fetch('/api/pick-folder').then(r=>r.json());
+    if (r.error) return toast('切换失败：' + r.error, true);
+    if (r.canceled) return toast('已取消');
+    ROWS = {}; SIG = '';          // 换目录了，每行的参数重新初始化
+    await refresh(true);
+    toast('热文件夹已切到 ' + r.folder);
+  }catch(e){ toast('切换失败：' + e, true); }
+}
+
+async function poll(){
+  try{
+    const r = await fetch('/api/status').then(r=>r.json());
+    const map = {};
+    let finished = false;
+    for (const j of r.jobs){
+      if (PREV[j.id] !== j.state){        // 有任务刚完成就去刷一下账单
+        if (j.state === '完成') finished = true;
+        PREV[j.id] = j.state;
+      }
+    }
+    // jobs 按 id 倒序，先写老的后写新的 => 每行保留最新状态
+    for (const j of r.jobs.slice().reverse()) map[j.name] = j;
+    LASTJOB = map;
+    if (FILES.length) paintStatus();
+    if (finished) loadLog();
+  }catch(e){}
+}
+
+refresh();
+loadLog();
+setInterval(()=>refresh(), 4000);
+setInterval(poll, 1500);
+setInterval(loadLog, 60000);
+</script>
+</body>
+</html>

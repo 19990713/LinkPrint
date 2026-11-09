@@ -1,0 +1,11 @@
+# 运行数据（含本机路径、真实账目、可再生的转换产物）：不入库
+.workbuddy/
+__pycache__/
+_转换缓存/
+热文件夹/
+测试文件/
+打印记录.csv
+config.json
+SumatraPDF.exe
+SumatraPDF-settings.txt
+*.part
