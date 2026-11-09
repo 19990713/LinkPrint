@@ -639,6 +639,11 @@ function loadEffect(page){
     if (!r.ok){
       let msg = '渲染失败';
       try { msg = (await r.json()).error || msg; } catch(e){}
+      // 404 + not found 只可能是后端还没有这个接口（服务没重启、跑的是旧代码），
+      // 不是这份文件的问题，别让用户以为文件坏了。
+      if (r.status === 404 && msg === 'not found')
+        throw Object.assign(new Error('当前打印服务是旧版本，没有「打印效果」接口，'
+          + '请关掉那个黑窗口重新双击「启动打印系统.bat」'), {stale: true});
       throw new Error(msg);
     }
     return {blob: await r.blob(), pct:+r.headers.get('X-LP-Pct'),
@@ -658,6 +663,11 @@ function loadEffect(page){
   }).catch(err => {
     if (id !== PV.req) return;
     $('#pvImg').style.opacity = 1;
+    if (err.stale){                                   // 服务是旧版：弹提示并退回原文件
+      toast(err.message, true);
+      setPvTab('raw');
+      return;
+    }
     $('#pvWarn').textContent = '⚠ ' + err.message;
   });
 }
