@@ -1,12 +1,15 @@
 # LinkPrint
 
 热文件夹批量打印：把 PDF / Word / 表格 / PPT / 图片丢进「热文件夹」，网页里逐份确认页数、
-尺寸、方向，设好份数/双面/色彩/纸张，一次性发出打印，并按页计费记账。
+尺寸、方向，设好份数/双面/色彩/纸张/缩放，一次性发出打印，并按页计费记账。
 
 - 预检（页数、实际尺寸、方向、混合尺寸提示）由 PyMuPDF 读 PDF 得出
 - Office 文件靠 `Convert2PDF.ps1`（WPS/Office COM）转 PDF，转换结果按 `名字_大小_时间.pdf` 缓存
 - 图片（jpg/png/bmp/tif/webp/gif）由 PyMuPDF 直接转 PDF，多页 TIFF 保留多页
 - 送印走 SumatraPDF 命令行；纸张用 `paperkind=`（DMPAPER 编号）避开驱动纸名匹配问题
+- 页面缩放四档：适合（`fit`，会缩也会放大）/ 实际大小（`noscale`）/ 缩小过大（`shrink`）/ 自定义比例。
+  前三档是 SumatraPDF 原生参数；**自定义比例没有原生支持**，由 PyMuPDF 把每页重排成 X% 的新 PDF
+  （缓存名带 `_s{pct}`，注释和表单会被拍平成内容），送印时按 `noscale` 打
 - 打印记录写入 `打印记录.csv`
 
 ## 运行
