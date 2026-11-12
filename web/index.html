@@ -163,6 +163,15 @@
   </select>
   <input type="number" id="dPct" value="100" min="10" max="400" title="自定义比例，10-400%">
   <span class="hint">%</span>
+  <label>每页张数</label>
+  <select id="dNup" title="把多页缩印到一张纸上（多页拼版），按纸张数计费">
+    <option value="1">1 页</option>
+    <option value="2">2 页</option>
+    <option value="4">4 页</option>
+    <option value="6">6 页</option>
+    <option value="9">9 页</option>
+    <option value="16">16 页</option>
+  </select>
   <button onclick="applyAll()">应用到全部</button>
   <div class="grow"></div>
   <span class="hint" id="stat"></span>
@@ -174,14 +183,14 @@
       <col style="width:36px"><col id="colFile">
       <col style="width:62px"><col style="width:86px"><col id="colSize" style="width:78px"><col style="width:66px">
       <col id="colPrinter"><col style="width:86px"><col style="width:84px">
-      <col style="width:84px"><col style="width:116px"><col style="width:100px"><col style="width:84px"><col><!-- 最后一列吃掉剩余宽度 -->
+      <col style="width:84px"><col style="width:116px"><col style="width:88px"><col style="width:100px"><col style="width:84px"><col><!-- 最后一列吃掉剩余宽度 -->
     </colgroup>
     <thead><tr>
       <th><input type="checkbox" id="chkAll" checked onchange="toggleAll(this.checked)"></th>
       <th class="c-file" title="拖动右边界可调宽">文件</th><th>页数</th>
       <th title="留空打全部；可写 1-3,5 / 5- / -2（倒数第 2 页）">页码范围</th>
       <th>尺寸</th><th>方向</th>
-      <th>打印机</th><th>份数</th><th>色彩</th><th>纸张</th><th>双面方式</th><th>缩放</th><th>状态</th><th></th>
+      <th>打印机</th><th>份数</th><th>色彩</th><th>纸张</th><th>双面方式</th><th>缩放</th><th>每页张数</th><th>状态</th><th></th>
     </tr></thead>
     <tbody id="tbody"></tbody>
   </table>
@@ -256,7 +265,7 @@ let ROWS = {};       // name -> {sel, printer, copies, color, paper, duplex, sca
 let LASTJOB = {};    // name -> job
 let PREV = {};       // job id -> 上次看到的状态
 let SIG = '';
-let DEF = {printer:'', copies:1, color:0, paper:'A4', duplex:'single', scale:'fit', pct:100};
+let DEF = {printer:'', copies:1, color:0, paper:'A4', duplex:'single', scale:'fit', pct:100, nup:1};
 
 const $ = s => document.querySelector(s);
 const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -297,7 +306,8 @@ function barValues(){
     paper: $('#dPaper').value,
     duplex: $('#dDuplex').value,
     scale: $('#dScale').value,
-    pct: Math.min(400, Math.max(10, parseInt($('#dPct').value) || 100))
+    pct: Math.min(400, Math.max(10, parseInt($('#dPct').value) || 100)),
+    nup: +$('#dNup').value || 1
   };
 }
 
@@ -332,6 +342,7 @@ async function refresh(fresh){
         duplex: DEF.duplex,
         scale: DEF.scale,
         pct: DEF.pct,
+        nup: DEF.nup,
         range: ''          // 页码范围：留空 = 全部页
       };
     }
@@ -470,6 +481,13 @@ function render(){
           <option value="custom" ${s.scale==='custom'?'selected':''}>自定义</option></select>
         <span class="pct"><input type="number" class="c-pct" min="10" max="400" value="${s.pct}">%</span>
       </td>
+      <td><select class="c-nup" title="把多页缩印到一张纸上，按纸张数计费">
+        <option value="1" ${(s.nup||1)===1?'selected':''}>1 页</option>
+        <option value="2" ${s.nup===2?'selected':''}>2 页</option>
+        <option value="4" ${s.nup===4?'selected':''}>4 页</option>
+        <option value="6" ${s.nup===6?'selected':''}>6 页</option>
+        <option value="9" ${s.nup===9?'selected':''}>9 页</option>
+        <option value="16" ${s.nup===16?'selected':''}>16 页</option></select></td>
       <td><span class="st ${cls}" ${job&&job.msg?`title="${esc(job.msg)}"`:''}>${esc(st)}</span></td>
       <td><button class="mini" data-act="pv" ${f.error?'disabled':''}>预览</button>
           <button class="mini" data-act="one">打印</button></td>
@@ -543,7 +561,9 @@ $('th.c-file').addEventListener('pointerdown', e => {
 
 function amount(f, s){
   const u = (CFG.prices || {})[s.paper + '|' + (s.color ? 1 : 0)] || 0;
-  return u * selPages(f, s) * s.copies;
+  const pages = selPages(f, s);
+  const nup = s.nup || 1;
+  return u * Math.ceil(pages / nup) * s.copies;
 }
 
 function updateStat(){
@@ -660,6 +680,7 @@ $('#tbody').addEventListener('change', e=>{
     const v = Math.min(400, Math.max(10, parseInt(e.target.value) || 100));
     e.target.value = v; s.pct = v;
   }
+  else if (e.target.classList.contains('c-nup')) s.nup = +e.target.value;
   else if (e.target.classList.contains('c-range')){
     s.range = e.target.value.trim();
     const f = FILES.find(x=>x.name === tr.dataset.n) || {pages:0};
@@ -691,16 +712,19 @@ let lastWheelAt = 0, gestureDone = false;  // 一次连续滑动里是否已经�
 
 function pvSummary(s, pages){
   const sc = s.scale === 'custom' ? `自定义 ${s.pct}%` : (SCALE_TXT[s.scale] || '适合');
-  return `${s.paper} · ${sc} · ${s.color ? '彩色' : '黑白'}` + (pages ? ` · ${pages} 页` : '');
+  const nup = (s.nup && s.nup > 1) ? ` · 每张 ${s.nup} 页` : '';
+  return `${s.paper} · ${sc}${nup} · ${s.color ? '彩色' : '黑白'}` + (pages ? ` · ${pages} 页` : '');
 }
 
 function openPv(name){
   const f = FILES.find(x=> x.name === name);
   if (!f) return;
   if (f.error) return toast('这份文件无法预览：' + f.detail, true);
-  const s = ROWS[name] || {paper:'A4', scale:'fit', pct:100, color:0};
+  const s = ROWS[name] || {paper:'A4', scale:'fit', pct:100, color:0, nup:1};
   PVQ = [];                            // 单文件模式：清掉上一次「全部预览」的序列
-  PV = {name, page:1, pages:f.pages || 1, tab:'effect', req:0, obj:'', s, i:0};
+  const nup = s.nup || 1;
+  const sheets = Math.ceil((f.pages || 1) / nup);
+  PV = {name, page:1, pages:sheets, tab:'effect', req:0, obj:'', s, i:0};
   wheelAcc = 0; wheelLock = 0;        // 换文件了，别带着上一次的滚轮残余
   gestureDone = false; lastWheelAt = 0;
   $('#pvTab').dataset.n = name;
@@ -716,10 +740,14 @@ function openPvAll(){
   if (!list.length) return toast('没有可预览的文件', true);
   PVQ = [];
   list.forEach((f, i) => {
-    for (let p = 1; p <= (f.pages || 1); p++)
+    const s = ROWS[f.name];
+    const nup = (s && s.nup) || 1;
+    const sheets = Math.ceil((f.pages || 1) / nup);   // 多页拼版：按纸张数摊平
+    for (let p = 1; p <= sheets; p++)
       PVQ.push({n: f.name, p, fi: i + 1, fn: list.length});
   });
-  PV = {name: list[0].name, page: 1, pages: list[0].pages || 1,
+  const n0 = (ROWS[list[0].name] && ROWS[list[0].name].nup) || 1;
+  PV = {name: list[0].name, page: 1, pages: Math.ceil((list[0].pages || 1) / n0),
         tab:'effect', req:0, obj:'', s:null, i: 0};
   wheelAcc = 0; wheelLock = 0;
   gestureDone = false; lastWheelAt = 0;
@@ -746,23 +774,26 @@ function loadEffect(){
   const it = PVQ[PV.i];                      // 全部预览：当前这一页属于哪个文件
   const name = it ? it.n : PV.name;
   const p = it ? it.p : PV.page;
-  const s = ROWS[name] || PV.s || {paper:'A4', scale:'fit', pct:100, color:0};
+  const s = ROWS[name] || PV.s || {paper:'A4', scale:'fit', pct:100, color:0, nup:1};
   const f = FILES.find(x => x.name === name);
-  const pages = (f && f.pages) || 1;
+  const nup = s.nup || 1;
+  const pages = Math.ceil(((f && f.pages) || 1) / nup);   // 多页拼版：按纸张数翻页
   const id = ++PV.req;
   // 切到「原文件」时 iframe 得换成当前这份，所以跨越文件时先清掉旧 PDF
   if (PV.name !== name) $('#pvFrame').src = 'about:blank';
   PV.name = name; PV.pages = pages;
   $('#pvTab').dataset.n = name;      // 「新标签打开」跟着当前文件走
   const q = new URLSearchParams({name, paper:s.paper, scale:s.scale,
-                                 pct:s.pct, page:p, gray:s.color ? 0 : 1, dpi:130});
+                                 pct:s.pct, page:p, gray:s.color ? 0 : 1, dpi:130,
+                                 nup});
   $('#pvTitle').textContent = PVQ.length ? `全部预览 · ${name}` : name;
   $('#pvMeta').textContent = PVQ.length
     ? `第 ${it.fi}/${it.fn} 个文件 · ${pvSummary(s)}`   // 页码由底部统一显示，这里不重复总页数
     : pvSummary(s, pages);
+  const unit = nup > 1 ? '张' : '页';
   $('#pvPage').textContent = PVQ.length
-    ? `第 ${PV.i + 1} 页 / 共 ${PVQ.length} 页`
-    : `第 ${p} 页 / 共 ${pages} 页`;
+    ? `第 ${PV.i + 1} ${unit} / 共 ${PVQ.length} ${unit}`
+    : `第 ${p} ${unit} / 共 ${pages} ${unit}`;
   $('#pvImg').style.opacity = .35;
   $('#pvWarn').textContent = '';
   fetch('/api/printpreview?' + q).then(async r => {
@@ -888,6 +919,7 @@ function applyAll(){
     s.printer = DEF.printer; s.copies = DEF.copies;
     s.paper = DEF.paper; s.duplex = DEF.duplex;
     s.scale = DEF.scale; s.pct = DEF.pct;
+    s.nup = DEF.nup;
     s.color = DEF.color;
   }
   render();
@@ -899,7 +931,8 @@ async function send(names, merge){
     const s = ROWS[n];
     return {name:n, printer:s.printer, copies:s.copies,
             color: !!s.color, paper:s.paper, duplex:s.duplex,
-            scale: s.scale, scale_pct: s.pct, pages_spec: s.range || ''};
+            scale: s.scale, scale_pct: s.pct, pages_spec: s.range || '',
+            nup: s.nup || 1};
   });
   try{
     const r = await fetch('/api/print', {method:'POST', headers:{'Content-Type':'application/json'},

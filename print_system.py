@@ -361,6 +361,110 @@ def scaled_pdf(src, pct):
     return t
 
 
+# ---------------- 多页（N-up） ----------------
+# 把 N 页缩印到一张纸上，和 Acrobat Reader 打印对话框的「每页张数」一个意思。
+# SumatraPDF 命令行没有 N-up 参数，所以和自定义比例一样：先用 PyMuPDF 拼成
+# 每张纸一份页面的新 PDF（缓存名带 _nup{N}），再按 noscale 送印。
+NUP_GRID = {1: (1, 1), 2: (1, 2), 4: (2, 2), 6: (2, 3), 9: (3, 3), 16: (4, 4)}
+
+
+def nup_target(src, nup):
+    st = os.stat(src)
+    stem = os.path.splitext(os.path.basename(src))[0]
+    return os.path.join(CONV_DIR, f"{stem}_{st.st_size}_{int(st.st_mtime)}_nup{nup}.pdf")
+
+
+def nup_pdf(src, nup, paper):
+    """把 src 每 nup 页缩印到一张 paper 纸上，返回缓存 PDF 路径。
+
+    纸张方向跟着网格走：列比行多就用横向纸（宽高对调），否则纵向。
+    每页按原始宽高比缩放进格子、不旋转，整体居中；页数和金额都按纸张数算。
+    """
+    nup = int(nup)
+    rows, cols = NUP_GRID.get(nup, (1, 1))
+    if nup == 1:
+        return printable_pdf(src)
+    t = nup_target(src, nup)
+    if os.path.isfile(t) and os.path.getsize(t):
+        return t
+    with SCALE_LOCK:
+        if os.path.isfile(t) and os.path.getsize(t):
+            return t
+        doc = fitz.open(printable_pdf(src))
+        try:
+            if doc.needs_pass:
+                raise RuntimeError("PDF 有密码，无法多页拼版")
+            if doc.page_count > 2000:
+                raise RuntimeError(f"页数太多（{doc.page_count}）")
+            n = doc.page_count
+            try:
+                doc.bake(annots=True, widgets=True)
+            except Exception:
+                pass
+            wmm, hmm = paper_mm(paper)
+            if cols > rows:                       # 横向网格用横向纸
+                pw, ph = max(wmm, hmm), min(wmm, hmm)
+            else:
+                pw, ph = min(wmm, hmm), max(wmm, hmm)
+            pw, ph = pw * 72 / 25.4, ph * 72 / 25.4
+            cell_w, cell_h = pw / cols, ph / rows
+            out = fitz.open()
+            try:
+                for i in range(0, n, nup):
+                    np_ = out.new_page(width=pw, height=ph)
+                    for j in range(nup):
+                        pno = i + j
+                        if pno >= n:
+                            break
+                        pg = doc[pno]
+                        # 每页独立缩放，塞进格子（不旋转，保持原方向）
+                        k = min(cell_w / pg.rect.width, cell_h / pg.rect.height)
+                        tw, th = pg.rect.width * k, pg.rect.height * k
+                        r_, c_ = divmod(j, cols)
+                        x0 = c_ * cell_w + (cell_w - tw) / 2
+                        y0 = r_ * cell_h + (cell_h - th) / 2
+                        target = fitz.Rect(x0, y0, x0 + tw, y0 + th)
+                        if pg.rotation:
+                            src_dpi = max(120, min(300, int(round(300 / max(k, 0.05)))))
+                            np_.insert_image(target, pixmap=_rotate_pixmap(
+                                pg.get_pixmap(dpi=src_dpi), 0))
+                        else:
+                            np_.show_pdf_page(target, doc, pno)
+                data = out.tobytes(deflate=True, garbage=1)
+            finally:
+                out.close()
+        finally:
+            doc.close()
+        os.makedirs(CONV_DIR, exist_ok=True)
+        part = t + ".part"
+        with open(part, "wb") as f:
+            f.write(data)
+        try:
+            os.replace(part, t)
+        except OSError:
+            if not os.path.isfile(t):
+                raise
+        finally:
+            if os.path.exists(part):
+                try:
+                    os.remove(part)
+                except OSError:
+                    pass
+        want = (n + nup - 1) // nup
+        try:
+            with fitz.open(t) as chk:
+                bad = chk.page_count != want
+        except Exception:
+            bad = True
+        if bad:
+            try:
+                os.remove(t)
+            except OSError:
+                pass
+            raise RuntimeError("多页拼版校验不通过（张数不符）")
+    return t
+
+
 def prune_cache(days=7):
     """清掉过期的缓存 PDF（源文件改过或删掉后，旧缓存再也不会被用到）。"""
     if not os.path.isdir(CONV_DIR):
@@ -444,9 +548,13 @@ def _rotate_pixmap(pix, rot):
     return fitz.Pixmap(cs, w, h, a.tobytes(), False)
 
 
-def preview_png(src, paper, mode="fit", pct=100, page_no=1, gray=False, dpi=120):
-    """按打印参数渲染整张纸的预览图，返回 (png bytes, 元信息 dict)。"""
-    doc = fitz.open(printable_pdf(src))
+def preview_png(src, paper, mode="fit", pct=100, page_no=1, gray=False, dpi=120, nup=1):
+    """按打印参数渲染整张纸的预览图，返回 (png bytes, 元信息 dict)。
+
+    nup>1 时先多页拼版成每张纸一份页面，再照 noscale 渲染那张纸；page_no / meta 里的
+    页数都按「纸张数」算，和真正送印时打出来的张数一致。
+    """
+    doc = fitz.open(nup_pdf(src, nup, paper) if nup > 1 else printable_pdf(src))
     try:
         if doc.needs_pass:
             raise RuntimeError("PDF 有密码，无法预览")
@@ -456,10 +564,21 @@ def preview_png(src, paper, mode="fit", pct=100, page_no=1, gray=False, dpi=120)
         pno = max(1, min(int(page_no), n))
         pg = doc[pno - 1]
         page_rot = pg.rotation          # 源页自带的 /Rotate，get_pixmap 会应用
-        rot, k, rect, over = print_layout(pg.rect.width, pg.rect.height,
-                                          paper, mode, pct)
+        # 多页拼版后的页面已经是纸张大小，按 noscale 100% 打（其余缩放档对它无意义）
+        m = "noscale" if nup > 1 else mode
         wmm, hmm = paper_mm(paper)
+        if nup > 1:
+            rows, cols = NUP_GRID.get(nup, (1, 1))
+            if cols > rows:                       # 拼版时横向网格用了横向纸
+                wmm, hmm = hmm, wmm
+        rot, k, rect, over = print_layout(pg.rect.width, pg.rect.height,
+                                          paper, m, pct)
         pw, ph = wmm * 72 / 25.4, hmm * 72 / 25.4
+        if nup > 1:
+            # 拼版页本身就是这张纸，noscale 不转不缩，直接满幅居中（不扣边距，看整张纸）
+            rot, k = 0, 1.0
+            rect = fitz.Rect(0, 0, pw, ph)
+            over = False
         out = fitz.open()
         try:
             # 自定义比例 >100% 时内容会超到纸外。show_pdf_page / insert_image
@@ -798,6 +917,28 @@ def conv_worker():
             CACHE.pop(b, None)          # 状态变了，下一轮刷新重新解析
 
 
+def select_pages(pdf, nums):
+    """抽出 nums 指定的页（1 起），写成一份临时 PDF。多页拼版前用来真正剔除
+    不打的页（拼版后页码变了，不能再靠 SumatraPDF 的页码参数）。"""
+    nums = sorted(set(nums))
+    doc = fitz.open(pdf)
+    try:
+        out = fitz.open()
+        try:
+            for p in nums:
+                out.insert_pdf(doc, from_page=p - 1, to_page=p - 1)
+            os.makedirs(MERGE_DIR, exist_ok=True)
+            t = os.path.join(MERGE_DIR, os.urandom(4).hex() + ".pdf")
+            part = t + ".part"
+            out.save(part, deflate=True, garbage=1)
+            os.replace(part, t)
+        finally:
+            out.close()
+    finally:
+        doc.close()
+    return t
+
+
 def merge_pdfs(pdfs):
     """把多份 PDF 首尾相接写成一份，返回新文件路径。各页尺寸保持不变。"""
     out = fitz.open()
@@ -822,7 +963,7 @@ def merge_pdfs(pdfs):
 
 
 # 只有这几项完全相同才能拼成一份打：拼起来就是一次送印，参数只能有一套
-MERGE_KEY = ("printer", "copies", "color", "paper", "duplex", "scale", "pct")
+MERGE_KEY = ("printer", "copies", "color", "paper", "duplex", "scale", "pct", "nup")
 
 
 def group_jobs(preps):
@@ -882,6 +1023,12 @@ def _validate(it):
             raise ValueError("自定义比例必须是整数")
         if not 10 <= pct <= 400:
             raise ValueError("自定义比例需在 10-400%")
+    try:
+        nup = int(it.get("nup", 1) or 1)
+    except (TypeError, ValueError):
+        raise ValueError("每页张数必须是整数")
+    if nup not in NUP_GRID:
+        raise ValueError("每页张数只能选 1/2/4/6/9/16")
     # 缓存里已经有解析结果就直接用；还没转好就先当 0 页，别在这里等 WPS
     info = preflight(path, allow_convert=False)
     if info.get("error"):
@@ -892,12 +1039,14 @@ def _validate(it):
     spec = str(it.get("pages_spec") or "").strip()
     pick = parse_pages(spec, total) if spec and total else None
     pages = len(pick) if pick else total
+    # 多页拼版：账单按纸张数算（N 页缩印到一张纸上），不是按文档页数
+    sheets = (pages + nup - 1) // nup if pages else 0
     return {"name": os.path.basename(path), "names": [os.path.basename(path)],
             "srcs": [path], "printer": printer, "copies": copies, "color": color,
-            "paper": paper, "duplex": duplex, "scale": scale, "pct": pct,
+            "paper": paper, "duplex": duplex, "scale": scale, "pct": pct, "nup": nup,
             "specs": [spec], "range": pages_text(pick) if pick else "",
             "pages": pages, "unit": unit,
-            "amount": round(unit * copies * pages, 2)}
+            "amount": round(unit * copies * sheets, 2)}
 
 
 def prepare(job):
@@ -936,8 +1085,21 @@ def prepare(job):
         off += n
     job["pages"] = len(nums)
     job["range"] = "" if job["pages"] == off else pages_text(nums)   # 全选就不用写页码
+    nup = job.get("nup", 1)
+    if nup > 1:
+        # 多页拼版后页数变了，页码参数不能再交给 SumatraPDF；先把要打的页真正抽成
+        # 一份 PDF（有页码筛选时），再整份拼版，最后按 noscale 打。
+        if job["range"]:
+            job["path"] = select_pages(job["path"], nums)
+            job["range"] = ""
+        nup_path = nup_pdf(job["path"], nup, job["paper"])
+        if nup_path != job["path"]:
+            job["path"] = nup_path
+        job["sheets"] = (job["pages"] + nup - 1) // nup
+        job["scale"] = "noscale"          # 拼版后的页面已是纸张大小，送印不缩放
     job["settings"] = build_settings(job)
-    job["amount"] = round(job["unit"] * job["copies"] * job["pages"], 2)
+    amount_pages = job.get("sheets", job["pages"])
+    job["amount"] = round(job["unit"] * job["copies"] * amount_pages, 2)
     return job
 
 
@@ -1060,8 +1222,9 @@ def clear_files(names):
     cache = 0
     for p in paths:
         t = conv_target(p)
-        # 缓存名是 名字_大小_时间.pdf，自定义比例再带 _s{pct}。只清这一份的，同名的别的文件不误伤
-        for f in [t] + glob.glob(t[:-4] + "_s*.pdf"):
+        # 缓存名是 名字_大小_时间.pdf，自定义比例再带 _s{pct}、多页拼版带 _nup{N}。
+        # 只清这一份的，同名的别的文件不误伤
+        for f in [t] + glob.glob(t[:-4] + "_s*.pdf") + glob.glob(t[:-4] + "_nup*.pdf"):
             if os.path.isfile(f):
                 try:
                     os.remove(f)
@@ -1155,7 +1318,8 @@ class Handler(BaseHTTPRequestHandler):
                 png, meta = preview_png(
                     fp, g("paper", "A4"), g("scale", "fit"),
                     float(g("pct", "100")), int(g("page", "1")),
-                    g("gray", "0") in ("1", "true"), int(g("dpi", "120")))
+                    g("gray", "0") in ("1", "true"), int(g("dpi", "120")),
+                    int(g("nup", "1")))
             except Exception as e:
                 return self._send(400, {"error": str(e)})
             return self._send(200, png, "image/png", {

@@ -170,7 +170,7 @@ assert len(files) >= 2, "合并打印自检需要至少两份测试 PDF"
 def _prep(f, **kw):
     d = {"name": os.path.basename(f), "names": [os.path.basename(f)], "srcs": [f],
          "printer": "D95", "copies": 1, "color": False, "paper": "A4",
-         "duplex": "single", "scale": "fit", "pct": 100}
+         "duplex": "single", "scale": "fit", "pct": 100, "nup": 1}
     d.update(kw)
     d["unit"] = ps.unit_price(d["paper"], d["color"])
     return d
@@ -317,3 +317,45 @@ try:
 finally:
     filedialog.askdirectory = _fb
 print("文件夹选择框 OK")
+
+# ---------------- 多页（N-up）拼版 ----------------
+_nup = ""
+try:
+    # 网格映射：1/2/4/6/9/16 -> rows, cols
+    assert ps.NUP_GRID == {1: (1, 1), 2: (1, 2), 4: (2, 2), 6: (2, 3), 9: (3, 3), 16: (4, 4)}
+    # nup=1 原样返回可打印 PDF，不拼版
+    assert ps.nup_pdf(files[0], 1, "A4") == ps.printable_pdf(files[0])
+    # 4 页文档 nup=4 -> 1 张；nup=2 -> 2 张，横向纸（841.9x595.3pt）
+    src4 = files[1]                       # 【A4】...双科.pdf 是 4 页
+    n4 = ps.preflight(src4)["pages"]
+    assert n4 == 4, n4
+    p = ps.nup_pdf(src4, 4, "A4")
+    with fitz.open(p) as d:
+        assert d.page_count == 1, d.page_count
+    os.remove(p)
+    p = ps.nup_pdf(src4, 2, "A4")
+    with fitz.open(p) as d:
+        assert d.page_count == 2, d.page_count
+        assert abs(d[0].rect.width - 841.9) < 1 and abs(d[0].rect.height - 595.3) < 1, \
+            (d[0].rect.width, d[0].rect.height)
+    os.remove(p)
+    # 预览：nup=2 返回横向纸 meta（297x210mm）
+    png, meta = ps.preview_png(src4, "A4", "fit", 100, 1, False, 120, nup=2)
+    assert meta["w"] == 297 and meta["h"] == 210 and meta["pages"] == 2, meta
+    # prepare：金额按纸张数计（4 页 nup=2 -> 2 张）
+    job = _prep(src4, copies=3, nup=2)
+    ps.prepare(job)
+    assert job.get("sheets") == 2 and job["scale"] == "noscale", job
+    assert abs(job["amount"] - 0.5 * 3 * 2) < 1e-9, job["amount"]
+    assert "noscale" in job["settings"] and "2x" not in job["settings"], job["settings"]
+    os.remove(job["path"])
+    # 页码筛选 + nup：4 页只打前 2 页，nup=2 -> 1 张
+    job = _prep(src4, nup=2, specs=["1-2"])
+    ps.prepare(job)
+    assert job.get("sheets") == 1, job
+    os.remove(job["path"])
+    print(f"多页拼版 OK  每张 2/4 页，金额按纸张数计，预览出横向纸")
+finally:
+    if _nup and os.path.isfile(_nup):
+        os.remove(_nup)
+
