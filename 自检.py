@@ -18,16 +18,20 @@ print("纸型识别 OK")
 
 # 打印参数串（不能带 portrait/landscape，否则和自动旋转叠加转两次；缩放默认 fit 适合纸张）
 j = {"copies": 2, "duplex": "short", "color": False, "paper": "A4"}
-assert ps.build_settings(j) == "2x,duplexshort,monochrome,paperkind=9,fit"
+assert ps.build_settings(j) == "2x,collate,duplexshort,monochrome,paperkind=9,fit"
 j.update(duplex="long", color=True)
-assert ps.build_settings(j) == "2x,duplexlong,color,paperkind=9,fit"
+assert ps.build_settings(j) == "2x,collate,duplexlong,color,paperkind=9,fit"
 # 缩放四档：fit 不加 center，其余三档加（内容小于纸面时居中）
 j.update(scale="shrink")
-assert ps.build_settings(j) == "2x,duplexlong,color,paperkind=9,shrink,center"
+assert ps.build_settings(j) == "2x,collate,duplexlong,color,paperkind=9,shrink,center"
 j.update(scale="noscale")
-assert ps.build_settings(j) == "2x,duplexlong,color,paperkind=9,noscale,center"
+assert ps.build_settings(j) == "2x,collate,duplexlong,color,paperkind=9,noscale,center"
 j.update(scale="custom", pct=85)
-assert ps.build_settings(j) == "2x,duplexlong,color,paperkind=9,noscale,center"
+assert ps.build_settings(j) == "2x,collate,duplexlong,color,paperkind=9,noscale,center"
+# 多份必须带 collate（逐份），单份不用
+assert "collate" in ps.build_settings(j)
+j.update(copies=1)
+assert ps.build_settings(j) == "1x,duplexlong,color,paperkind=9,noscale,center"
 print("打印参数 OK")
 
 # 计费：A4 黑白 0.5 / 彩色 2，A3 翻倍
@@ -157,6 +161,133 @@ with fitz.open(files[0]) as _d:
     assert meta["pages"] == _d.page_count, meta
 assert meta["pct"] == 96 and meta["rot"] == 0 and (meta["w"], meta["h"]) == (210, 297), meta
 print(f"打印效果预览 OK  首屏 {meta['pct']}% {meta['w']}×{meta['h']}mm {len(png)//1024}KB")
+
+# ---------------- 合并打印 ----------------
+# 同参数的一组归成一份任务，准备阶段才真正拼 PDF（下单请求不等合并）
+assert len(files) >= 2, "合并打印自检需要至少两份测试 PDF"
+
+
+def _prep(f, **kw):
+    d = {"name": os.path.basename(f), "names": [os.path.basename(f)], "srcs": [f],
+         "printer": "D95", "copies": 1, "color": False, "paper": "A4",
+         "duplex": "single", "scale": "fit", "pct": 100}
+    d.update(kw)
+    d["unit"] = ps.unit_price(d["paper"], d["color"])
+    return d
+
+
+_a, _b = _prep(files[0]), _prep(files[1])
+_c = _prep(files[0], paper="A3")            # 纸张不同，必须单独一组
+groups = ps.group_jobs([_a, _b, _c])
+assert len(groups) == 2, groups
+_pa, _pb = ps.preflight(files[0])["pages"], ps.preflight(files[1])["pages"]
+job = ps.prepare(ps._merge_group([g for g in groups if len(g) > 1][0]))
+assert job["pages"] == _pa + _pb, job
+assert job["tmp"] is True and os.path.isfile(job["path"]), job
+assert abs(job["amount"] - (_a["unit"] * (_pa + _pb))) < 1e-9, job
+with fitz.open(job["path"]) as _d:
+    assert _d.page_count == job["pages"], (_d.page_count, job["pages"])
+os.remove(job["path"])
+print(f"合并打印 OK  {_pa}+{_pb}页 -> 一份 PDF，分成 {len(groups)} 组")
+
+
+# ---------------- 页码范围 ----------------
+assert ps.parse_pages("", 10) == list(range(1, 11))     # 空 = 全部
+assert ps.parse_pages("", 0) is None                    # 页数未知时也返回「全部」
+assert ps.parse_pages("3", 10) == [3]
+assert ps.parse_pages("2-5", 10) == [2, 3, 4, 5]
+assert ps.parse_pages("1-3,5", 10) == [1, 2, 3, 5]
+assert ps.parse_pages("5-", 10) == [5, 6, 7, 8, 9, 10]  # 到末尾
+assert ps.parse_pages("-2", 10) == [9]                  # -2 = 倒数第 2 页（同 SumatraPDF）
+assert ps.parse_pages("-3--1", 10) == [8, 9, 10]        # 最后三页
+assert ps.parse_pages("3-1", 10) == [1, 2, 3]           # 反向范围自动转正
+assert ps.parse_pages("1，3 5、7", 10) == [1, 3, 5, 7]  # 中文逗号/顿号/空格都当分隔符
+assert ps.parse_pages("1 - 3", 10) == [1, 2, 3]
+assert ps.parse_pages("all", 4) == [1, 2, 3, 4]
+assert ps.parse_pages("1-3", 0) == [1, 2, 3]            # 页数未知只校验语法
+for bad in ("0", "11", "1-11", "abc", "1,,2-x", "-"):
+    try:
+        ps.parse_pages(bad, 10)
+        raise AssertionError(f"应该报错：{bad}")
+    except ValueError:
+        pass
+assert ps.pages_text([1, 2, 3, 5]) == "1-3,5"
+assert ps.pages_text([1, 2]) == "1,2"
+assert ps.pages_text([4]) == "4"
+assert ps.pages_text(list(range(1, 11))) == "1-10"
+# 页码排在参数串最前
+assert ps.build_settings({"copies": 1, "duplex": "single", "color": False,
+                          "paper": "A4", "scale": "fit", "range": "1-3"}) \
+       == "1-3,1x,simplex,monochrome,paperkind=9,fit"
+# 单份：4 页的文档只打前 2 页，页数/金额/参数串都跟着变
+_p4 = ps.preflight(files[1])["pages"]
+_r = _prep(files[1], specs=["1-2"])
+job = ps.prepare(_r)
+assert job["pages"] == 2 and job["range"] == "1,2", job
+assert abs(job["amount"] - _r["unit"] * 2) < 1e-9, job
+assert job["settings"].startswith("1,2,"), job["settings"]
+# 多份合并：第二份的页码要按第一份的页数整体后移
+job = ps.prepare(ps._merge_group([_prep(files[0], specs=["2-"]), _prep(files[1], specs=["1"])]))
+want = [2, 3]                                   # files[0]=2页取第2页；files[1]取第1页 -> 合并后是第3页
+assert job["pages"] == len(want), (job["pages"], want)
+assert ps.parse_pages(job["range"], _pa + _p4) == want, job["range"]
+assert abs(job["amount"] - _r["unit"] * len(want)) < 1e-9, job
+os.remove(job["path"])
+# 选满全部页时不该写页码，让 Sumatra 打整份
+job = ps.prepare(_prep(files[1], specs=["1-"]))
+assert job["range"] == "" and job["pages"] == _p4, job
+
+# 网页下单那一层：pages_spec 一路传到 _validate，越界在下单时就挡掉（不用等准备阶段）
+_old_hot, ps.HOT = ps.HOT, os.path.join(here, "测试文件")
+try:
+    _it = {"name": os.path.basename(files[1]), "printer": ps.PRINTERS[0], "copies": 1,
+           "paper": "A4", "duplex": "single", "scale": "fit", "pages_spec": "1-2"}
+    d = ps._validate(dict(_it))
+    assert d["pages"] == 2 and d["range"] == "1,2" and d["specs"] == ["1-2"], d
+    try:
+        ps._validate(dict(_it, pages_spec="1-99"))
+        raise AssertionError("越界页码应该在下单时就被挡掉")
+    except ValueError:
+        pass
+    d = ps._validate(dict(_it, pages_spec=""))
+    assert d["pages"] == _p4 and d["range"] == "", d
+finally:
+    ps.HOT = _old_hot
+print(f"页码范围 OK  {_p4}页文档抽 1-2 页，合并时自动偏移")
+
+# ---------------- 清空队列 ----------------
+# 只删名单里的源文件，热文件夹里别的东西不碰；缓存 PDF 和合并临时文件一起清
+import shutil
+_old_hot, _old_merge = ps.HOT, ps.MERGE_DIR
+hot2 = tempfile.mkdtemp(prefix="lp_clear_")
+ps.HOT = hot2
+ps.MERGE_DIR = os.path.join(hot2, "_m")
+try:
+    src = os.path.join(hot2, "要删.pdf")
+    shutil.copyfile(files[0], src)
+    cache = ps.conv_target(src)                 # 伪造一份转换缓存
+    with open(cache, "wb") as f:
+        f.write(b"cache")
+    keep = os.path.join(hot2, "别动.txt")
+    with open(keep, "w") as f:
+        f.write("x")
+    r = ps.clear_files(["要删.pdf"])
+    assert r["removed"] == 1 and r["cache"] == 1 and not r["failed"], r
+    assert not os.path.exists(src) and not os.path.exists(cache), "源文件和缓存都该没了"
+    assert os.path.exists(keep), "非打印文件不该被删"
+    # 名字只按 basename 解析，所以 "../x.pdf" 出不了热文件夹
+    outside = os.path.join(os.path.dirname(hot2), "lp_outside.pdf")
+    with open(outside, "wb") as f:
+        f.write(b"x")
+    try:
+        assert ps.clear_files(["../lp_outside.pdf"])["removed"] == 0
+        assert os.path.exists(outside), "不该删到热文件夹外面的文件"
+    finally:
+        os.remove(outside)
+    print(f"清空队列 OK  删 {r['removed']} 个源文件 + {r['cache']} 个缓存 PDF")
+finally:
+    ps.HOT, ps.MERGE_DIR = _old_hot, _old_merge
+    shutil.rmtree(hot2, ignore_errors=True)
 
 # ---------------- 切换热文件夹 ----------------
 import json

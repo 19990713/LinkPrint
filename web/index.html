@@ -28,6 +28,8 @@
   button.primary:hover{background:#2549c9}
   button.primary:disabled{background:#b9c4de;border-color:#b9c4de;cursor:not-allowed}
   button.mini{padding:3px 9px;font-size:12px;border-radius:6px}
+  button.danger{color:#c62828;border-color:#f0cccc}
+  button.danger:hover{background:#fdf3f3;border-color:#e0a5a5}
 
   .bar{display:flex;flex-wrap:wrap;align-items:center;gap:10px;padding:10px 18px;
        background:var(--card);border-bottom:1px solid var(--line)}
@@ -64,6 +66,10 @@
   .name a{color:var(--text);text-decoration:none;font-weight:500}
   .name a:hover{color:var(--accent);text-decoration:underline}
   .sub{color:var(--muted);font-size:11px;margin-top:1px}
+  .sub.sel{color:var(--accent);font-weight:600}
+  /* 页码范围：留空 = 全部，写了只打这几页 */
+  .c-range{width:100%;padding:4px 5px;font-size:12px;text-align:center}
+  .c-range.bad{border-color:#e0a5a5;background:#fdf3f3}
   .badge{display:inline-block;padding:2px 8px;border-radius:5px;background:#eef1f6;
          font-weight:600;font-size:12px}
   .badge.ok{background:var(--accent-soft);color:var(--accent)}
@@ -166,13 +172,15 @@
   <table>
     <colgroup>
       <col style="width:36px"><col id="colFile">
-      <col style="width:62px"><col id="colSize" style="width:78px"><col style="width:66px">
+      <col style="width:62px"><col style="width:86px"><col id="colSize" style="width:78px"><col style="width:66px">
       <col id="colPrinter"><col style="width:86px"><col style="width:84px">
       <col style="width:84px"><col style="width:116px"><col style="width:100px"><col style="width:84px"><col><!-- 最后一列吃掉剩余宽度 -->
     </colgroup>
     <thead><tr>
       <th><input type="checkbox" id="chkAll" checked onchange="toggleAll(this.checked)"></th>
-      <th class="c-file" title="拖动右边界可调宽">文件</th><th>页数</th><th>尺寸</th><th>方向</th>
+      <th class="c-file" title="拖动右边界可调宽">文件</th><th>页数</th>
+      <th title="留空打全部；可写 1-3,5 / 5- / -2（倒数第 2 页）">页码范围</th>
+      <th>尺寸</th><th>方向</th>
       <th>打印机</th><th>份数</th><th>色彩</th><th>纸张</th><th>双面方式</th><th>缩放</th><th>状态</th><th></th>
     </tr></thead>
     <tbody id="tbody"></tbody>
@@ -187,8 +195,12 @@
   <span class="money" id="mToday">今日 ¥0.00</span>
   <span class="money" id="mTotal">累计 ¥0.00</span>
   <button class="mini" onclick="openLog()">打印记录</button>
+  <button class="mini danger" id="btnClear" onclick="clearQueue()"
+          title="删除勾选的源文件（进回收站）以及它们的缓存 PDF、合并临时文件">清空队列</button>
   <div class="grow"></div>
   <span class="hint">勾选后一次性发出，队列按顺序送印</span>
+  <button class="primary" id="btnMerge" onclick="printAll(true)"
+          title="把勾选的文件拼成一份 PDF，一次送印（比逐个发快）。参数不同的会自动分组，各拼一份">合并打印</button>
   <button class="primary" onclick="printAll()">发出打印</button>
 </div>
 
@@ -319,7 +331,8 @@ async function refresh(fresh){
         paper: f.paper || 'A4',
         duplex: DEF.duplex,
         scale: DEF.scale,
-        pct: DEF.pct
+        pct: DEF.pct,
+        range: ''          // 页码范围：留空 = 全部页
       };
     }
     const s = ROWS[f.name];
@@ -331,19 +344,26 @@ async function refresh(fresh){
     s.pct = Math.min(400, Math.max(10, parseInt(s.pct) || 100));
   }
   for (const k of Object.keys(ROWS)) if (!seen.has(k)) delete ROWS[k];
-  const sg = FILES.map(f=>f.name + '@' + f.mtime).join('|')
+  // 文件没变就只刷状态，别冲掉正在输入的控件；页数/转换状态变了也要重画
+  const sg = FILES.map(f=>f.name + '@' + f.mtime + ':' + f.pages + (f.pending ? 'p' : ''))
+                   .join('|')
            + '#' + CFG.printers.join(',') + '#' + CFG.papers.join(',');
-  if (sg === SIG) paintStatus();          // 文件没变就只刷状态，别冲掉正在输入的控件
+  if (sg === SIG) paintStatus();
   else { SIG = sg; render(); }
+}
+
+// 任务状态 -> 圆点配色。准备中也是「正在忙」，别让它看着像没动
+function stCls(st){
+  return (st==='打印中'||st==='准备中'||st==='排队中') ? 'doing'
+       : st==='完成' ? 'done' : st==='失败' ? 'err' : '';
 }
 
 function paintStatus(){
   document.querySelectorAll('#tbody tr.row').forEach(tr=>{
     const j = LASTJOB[tr.dataset.n];
     const st = j ? j.state : '—';
-    const cls = (st==='打印中'||st==='排队中') ? 'doing' : st==='完成' ? 'done' : st==='失败' ? 'err' : '';
     const el = tr.querySelector('.st');
-    el.className = 'st ' + cls;
+    el.className = 'st ' + stCls(st);
     el.textContent = st;
     el.title = (j && j.msg) || '';
   });
@@ -357,6 +377,60 @@ function fillSelects(){
   setColorOptions($('#dColor'), isColorMachine(DEF.printer), DEF.color);
 }
 
+// ---------------- 页码范围 ----------------
+// 规则和 print_system.py 的 parse_pages 一致：空=全部、5、2-6、5-（到末尾）、-1（末页）。
+// 前端这份只用来即时算钱和标错，真正送印的页码由后端按真实页数重新解析。
+function parsePages(spec, total){
+  const s = String(spec || '').trim();
+  if (!s) return {list:null, err:''};
+  const t = s.replace(/[０-９]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0))
+             .replace(/[，、；;]/g, ',').replace(/[－—–~～]/g, '-')
+             .replace(/\s*-\s*/g, '-').replace(/\s+/g, ',');
+  const out = new Set();
+  const abs = v => v < 0 ? total + v + 1 : v;      // 负数从末尾数
+  for (const tok of t.split(',').filter(Boolean)){
+    if (/^(all|全部|全部页|\*)$/i.test(tok)){
+      if (!total) return {err:'「全部」要等页数出来'};
+      for (let i = 1; i <= total; i++) out.add(i);
+      continue;
+    }
+    let m = /^(-?\d+)$/.exec(tok);
+    if (m){
+      const v = abs(+m[1]);
+      if (v < 1 || (total && v > total))
+        return {err:`第 ${m[1]} 页不存在（共 ${total || '?'} 页）`};
+      out.add(v); continue;
+    }
+    m = /^(-?\d+)-(-?\d*)$/.exec(tok);
+    if (m){
+      let a = abs(+m[1]), b = m[2] === '' ? total : abs(+m[2]);
+      if (!b) return {err:`「${tok}」要等页数出来`};
+      if (a > b) [a, b] = [b, a];
+      if (a < 1 || (total && b > total))
+        return {err:`第 ${a}-${b} 页超出范围（共 ${total || '?'} 页）`};
+      for (let i = a; i <= b; i++) out.add(i);
+      continue;
+    }
+    return {err:`看不懂的页码：${tok}`};
+  }
+  if (!out.size) return {err:'没有有效的页码'};
+  return {list:[...out].sort((x, y) => x - y), err:''};
+}
+
+function pageErr(f, s){ return parsePages(s.range, f.pages || 0); }
+
+// 这一行实际要打几页
+function selPages(f, s){
+  const r = pageErr(f, s);
+  return r.err || !r.list ? (f.pages || 0) : r.list.length;
+}
+
+function pagesCell(f, s){
+  if (f.pending) return '<b>…</b>';
+  const n = selPages(f, s);
+  return `<b>${f.pages}</b>` + (n !== f.pages ? `<div class="sub sel">选 ${n} 页</div>` : '');
+}
+
 function render(){
   const tb = $('#tbody');
   $('#empty').style.display = FILES.length ? 'none' : 'block';
@@ -364,16 +438,21 @@ function render(){
     const s = ROWS[f.name];
     const job = LASTJOB[f.name];
     const st = job ? job.state : '—';
-    const cls = st==='打印中'||st==='排队中' ? 'doing' : st==='完成' ? 'done' : st==='失败' ? 'err' : '';
+    const cls = stCls(st);
     const orient = f.orientation;
+    const sub = f.pending ? '转换中…'
+              : `${f.mb} MB${f.kind ? ' · ' + f.kind + ' 转 PDF' : ''}`;
     return `<tr class="row" data-n="${esc(f.name)}">
       <td><input type="checkbox" class="c-sel" ${s.sel?'checked':''}></td>
       <td class="c-file">
         <span class="name"><a href="/pdf/${encodeURIComponent(f.name)}#view=Fit" target="_blank" title="${esc(f.detail)}">${esc(f.name)}</a></span>
-        <div class="sub">${f.mb} MB${f.kind ? ' · ' + f.kind + ' 转 PDF' : ''}</div>
+        <div class="sub">${sub}</div>
       </td>
-      <td><b>${f.pages}</b></td>
-      <td><span class="badge ${f.size==='混合'?'mix':''}" title="${esc(f.detail)}">${esc(f.size)}</span></td>
+      <td class="c-pages">${pagesCell(f, s)}</td>
+      <td><input class="c-range ${pageErr(f, s).err ? 'bad' : ''}" value="${esc(s.range || '')}"
+                 placeholder="全部" title="${esc(pageErr(f, s).err ||
+                   '留空打全部；可写 1-3,5 / 5- / -2（倒数第 2 页）')}"></td>
+      <td class="c-size"><span class="badge ${f.size==='混合'?'mix':''}" title="${esc(f.detail)}">${esc(f.size)}</span></td>
       <td>${orient==='混合' ? `<span class="badge mix" title="${esc(f.detail)}">混合</span>` : esc(orient)}</td>
       <td><select class="c-printer">${CFG.printers.map(p=>`<option ${p===s.printer?'selected':''}>${esc(p)}</option>`).join('')}</select></td>
       <td><input type="number" class="c-copies" min="1" max="999" value="${s.copies}"></td>
@@ -406,7 +485,7 @@ function render(){
 // 量出来按需加宽（只增不减，避免刷新时列宽抖动）。
 function fitSizeCol(){
   let w = 0;
-  for (const td of document.querySelectorAll('#tbody tr td:nth-child(4)'))
+  for (const td of document.querySelectorAll('#tbody tr td.c-size'))
     w = Math.max(w, td.firstElementChild ? td.firstElementChild.offsetWidth : td.scrollWidth);
   const col = $('#colSize'), need = w + 20;          // + 单元格左右 padding
   if (need > (parseFloat(col.style.width) || 0)){
@@ -464,16 +543,19 @@ $('th.c-file').addEventListener('pointerdown', e => {
 
 function amount(f, s){
   const u = (CFG.prices || {})[s.paper + '|' + (s.color ? 1 : 0)] || 0;
-  return u * (f.pages || 0) * s.copies;
+  return u * selPages(f, s) * s.copies;
 }
 
 function updateStat(){
   const sel = FILES.filter(f=>ROWS[f.name].sel);
   const copies = sel.reduce((a,f)=>a + ROWS[f.name].copies, 0);
+  const pages = sel.reduce((a,f)=>a + selPages(f, ROWS[f.name]), 0);
   const money = sel.reduce((a,f)=>a + amount(f, ROWS[f.name]), 0);
-  $('#selInfo').textContent = `已选 ${sel.length} 个文件 · ${copies} 份 · 本次 ¥${money.toFixed(2)}`;
+  $('#selInfo').textContent =
+    `已选 ${sel.length} 个文件 · ${pages} 页 · ${copies} 份 · 本次 ¥${money.toFixed(2)}`;
   $('#stat').textContent = `共 ${FILES.length} 个文件`;
   $('#btnAll').disabled = !sel.length;
+  $('#btnMerge').disabled = !sel.length;
   const all = FILES.length && FILES.every(f=>ROWS[f.name].sel);
   $('#chkAll').checked = !!all;
 }
@@ -578,6 +660,15 @@ $('#tbody').addEventListener('change', e=>{
     const v = Math.min(400, Math.max(10, parseInt(e.target.value) || 100));
     e.target.value = v; s.pct = v;
   }
+  else if (e.target.classList.contains('c-range')){
+    s.range = e.target.value.trim();
+    const f = FILES.find(x=>x.name === tr.dataset.n) || {pages:0};
+    const r = pageErr(f, s);
+    e.target.classList.toggle('bad', !!r.err);
+    e.target.title = r.err || '留空打全部；可写 1-3,5 / 5- / -2（倒数第 2 页）';
+    if (r.err) toast('页码范围：' + r.err, true);
+    tr.querySelector('td.c-pages').innerHTML = pagesCell(f, s);   // 只重画页数格，别整表重建
+  }
   updateStat();
 });
 
@@ -621,7 +712,7 @@ function openPv(name){
 // 「全部预览」：把每个文件的每一页摊平成一条序列，一个窗口从头翻到尾，
 // 翻页时按各自那一行的纸张/缩放/色彩渲染，不用一份一份点。
 function openPvAll(){
-  const list = FILES.filter(f => !f.error);
+  const list = FILES.filter(f => !f.error && !f.pending);
   if (!list.length) return toast('没有可预览的文件', true);
   PVQ = [];
   list.forEach((f, i) => {
@@ -803,26 +894,57 @@ function applyAll(){
   toast('已应用默认设置到全部文件');
 }
 
-async function send(names){
+async function send(names, merge){
   const jobs = names.map(n=>{
     const s = ROWS[n];
     return {name:n, printer:s.printer, copies:s.copies,
             color: !!s.color, paper:s.paper, duplex:s.duplex,
-            scale: s.scale, scale_pct: s.pct};
+            scale: s.scale, scale_pct: s.pct, pages_spec: s.range || ''};
   });
   try{
     const r = await fetch('/api/print', {method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({jobs})}).then(r=>r.json());
+      body: JSON.stringify({jobs, merge: !!merge})}).then(r=>r.json());
     if (r.error) return toast('发出失败：' + r.error, true);
-    toast(`已发出 ${r.queued.length} 个打印任务`);
+    // 后端立刻返回（转换/合并都在后台做），先把「排队中」写进表格，别等下一轮轮询
+    for (const q of r.queued || []){
+      const st = {id:q.id, name:q.name, names:q.names || [q.name], state:q.state || '排队中'};
+      LASTJOB[q.name] = st;
+      for (const n of st.names) LASTJOB[n] = st;
+    }
+    ACTIVE = Math.max(ACTIVE, (r.queued || []).length);
+    if (FILES.length) paintStatus();
+    toast(merge ? `已合并为 ${r.queued.length} 个打印任务（共 ${names.length} 份文件）`
+                : `已发出 ${r.queued.length} 个打印任务`);
     poll();
   }catch(err){ toast('发出失败：' + err, true); }
 }
 
-function printAll(){
+function printAll(merge){
   const names = FILES.filter(f=>ROWS[f.name].sel).map(f=>f.name);
   if (!names.length) return toast('没有勾选文件', true);
-  send(names);
+  send(names, merge);
+}
+
+// 清空队列：删勾选的源文件（进回收站）+ 它们的缓存 PDF + 合并临时文件。
+// 删除清单先摊给用户看，热文件夹里不是打印件的文件后端一个字不碰。
+async function clearQueue(){
+  const names = FILES.filter(f=>ROWS[f.name].sel).map(f=>f.name);
+  if (!names.length) return toast('没有勾选文件', true);
+  const list = names.length > 15
+    ? names.slice(0, 15).join('\n') + `\n……共 ${names.length} 个`
+    : names.join('\n');
+  if (!confirm(`从热文件夹删除这 ${names.length} 个文件？\n\n${list}\n\n` +
+               `连同它们的缓存 PDF、合并临时文件一起清掉。\n` +
+               `源文件进回收站，可还原。`)) return;
+  try{
+    const r = await fetch('/api/clear', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({names})}).then(r=>r.json());
+    if (r.error) return toast('清空失败：' + r.error, true);
+    toast(`已删 ${r.removed} 个文件，清掉 ${r.cache} 个缓存 PDF`
+          + (r.merged ? `、${r.merged} 个合并临时文件` : '')
+          + (r.failed && r.failed.length ? `；${r.failed.length} 个删不掉（被占用？）` : ''));
+    await refresh(true);
+  }catch(e){ toast('清空失败：' + e, true); }
 }
 
 async function openFolder(){ await fetch('/api/open-folder'); }
@@ -839,6 +961,9 @@ async function pickFolder(){
   }catch(e){ toast('切换失败：' + e, true); }
 }
 
+// 轮询：有任务在跑就 0.6 秒一次（状态变得快），闲下来降到 2.5 秒省资源。
+// ACTIVE 由后端返回的任务状态算出来，不用前端自己猜。
+let ACTIVE = 0;
 async function poll(){
   try{
     const r = await fetch('/api/status').then(r=>r.json());
@@ -851,17 +976,30 @@ async function poll(){
       }
     }
     // jobs 按 id 倒序，先写老的后写新的 => 每行保留最新状态
-    for (const j of r.jobs.slice().reverse()) map[j.name] = j;
+    for (const j of r.jobs.slice().reverse()){
+      if (j.names && j.names.length) for (const n of j.names) map[n] = j;
+      else map[j.name] = j;
+    }
     LASTJOB = map;
+    ACTIVE = r.jobs.filter(j=>j.state==='排队中'||j.state==='准备中'||j.state==='打印中').length;
     if (FILES.length) paintStatus();
     if (finished) loadLog();
   }catch(e){}
 }
+function pollLoop(){
+  setTimeout(async ()=>{ await poll(); pollLoop(); }, ACTIVE ? 600 : 2500);
+}
+
+// 刷新：有文件正在转 PDF 就 1.2 秒一次（页数一出来马上显示），否则 4 秒
+function refreshLoop(){
+  const gap = FILES.some(f=>f.pending) ? 1200 : 4000;
+  setTimeout(async ()=>{ await refresh(); refreshLoop(); }, gap);
+}
 
 refresh();
 loadLog();
-setInterval(()=>refresh(), 4000);
-setInterval(poll, 1500);
+refreshLoop();
+pollLoop();
 setInterval(loadLog, 60000);
 
 </script>

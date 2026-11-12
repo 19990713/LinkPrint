@@ -8,4 +8,5 @@ _转换缓存/
 config.json
 SumatraPDF.exe
 SumatraPDF-settings.txt
+sumatrapdfcache/
 *.part

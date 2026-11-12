@@ -5,15 +5,18 @@
 流程：PDF 丢进「热文件夹」→ 网页里逐份调参数 → 一次性发出打印。
 """
 import csv
+import glob
 import json
 import os
 import queue
+import re
 import socket
 import subprocess
 import sys
 import threading
 import time
 import webbrowser
+import zlib
 from collections import Counter
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import parse_qs, unquote, urlparse
@@ -110,6 +113,13 @@ def classify(w, h):
 
 
 CACHE = {}  # path -> ((mtime, size), info)
+
+# 后台转换的状态：WANT 是「已排进队列/正在转」的文件（值=文件指纹），
+# FAIL 记着转失败的文件（值=(指纹, 原因)），避免每个刷新周期都去重试一遍。
+CONV_WANT = {}
+CONV_FAIL = {}
+CONV_STATE_LOCK = threading.Lock()
+CONV_Q = queue.Queue()
 
 # ---------------- Office -> PDF ----------------
 # 分类名同时用作界面上的小标签，扩展名集合就是「能被打印」的 Office 格式
@@ -214,11 +224,75 @@ def printable_pdf(src):
     return hit
 
 
+def needs_convert(path):
+    """这份文件要送去打印前，还得先转成 PDF 吗？"""
+    return (ext_of(path) in OFFICE_EXT or ext_of(path) in IMG_EXT) and not cached_pdf(path)
+
+
+def request_convert(path):
+    """把文件排进后台转换队列。已经在队列里/正在转的不会重复排。"""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return
+    key = (st.st_mtime, st.st_size)
+    with CONV_STATE_LOCK:
+        if CONV_WANT.get(path) == key:
+            return
+        CONV_WANT[path] = key
+    CONV_Q.put(path)
+
+
 def scaled_target(src, pct):
     """自定义比例的缓存路径。带上源文件的 mtime+size，源一改缓存自动作废。"""
     st = os.stat(src)
     stem = os.path.splitext(os.path.basename(src))[0]
     return os.path.join(CONV_DIR, f"{stem}_{st.st_size}_{int(st.st_mtime)}_s{int(pct)}.pdf")
+
+
+def _slow_rescale(doc, k):
+    """重建页面：show_pdf_page 只搬内容流是矢量缩放，但每页都要按 zlib 最高级别
+    重压一遍内容流（1.5MB 内容 ≈ 220ms/页），慢在这一步。带 /Rotate 的页面走这条路最稳。"""
+    out = fitz.open()
+    try:
+        for pg in doc:
+            np_ = out.new_page(width=pg.rect.width * k, height=pg.rect.height * k)
+            np_.show_pdf_page(np_.rect, doc, pg.number)
+        return out.tobytes(deflate=True, garbage=3)
+    finally:
+        out.close()
+
+
+def _fast_rescale(doc, k):
+    """原地拷页，只在内容流最外层套一句 q..cm..Q 做缩放。
+
+    等价于 show_pdf_page 的矢量缩放（不重采样、画质一样），但省掉了重新压缩内容流：
+    自己按 zlib 低级别打包，实测 4 页文档 0.90s -> 0.13s，文件大约大 18%。
+    /Rotate 的页面不用这条路（旋转下裁剪框语义不好伺候），调用方会退回 _slow_rescale。
+    """
+    out = fitz.open()
+    try:
+        out.insert_pdf(doc)
+        for pg in out:
+            rc = pg.cropbox
+            xrefs = pg.get_contents()
+            if xrefs:
+                raw = b"\n".join(out.xref_stream(x) for x in xrefs)
+                # 缩放 + 把裁剪框左下角挪到原点（源页裁剪框可能不在 0,0）
+                head = b"q %.6f 0 0 %.6f %.6f %.6f cm\n" % (k, k, -rc.x0 * k, -rc.y0 * k)
+                data = zlib.compress(head + raw + b"\nQ\n", 1)
+                out.update_stream(xrefs[0], data, compress=False)
+                out.xref_set_key(xrefs[0], "Filter", "/FlateDecode")
+                out.xref_set_key(xrefs[0], "Length", str(len(data)))
+                for x in xrefs[1:]:          # 多段内容流合并成一段了，其余清空
+                    out.update_stream(x, b"", compress=False)
+                    out.xref_set_key(x, "Filter", "/FlateDecode")
+            # 不先删掉 CropBox，MediaBox 就改不动（MuPDF 要求 CropBox 必须落在 MediaBox 内）
+            out.xref_set_key(pg.xref, "CropBox", "null")
+            out.reload_page(pg).set_mediabox(fitz.Rect(0, 0, rc.width * k, rc.height * k))
+        return out.tobytes(deflate=False, garbage=1)
+    finally:
+        out.close()
 
 
 def scaled_pdf(src, pct):
@@ -239,20 +313,22 @@ def scaled_pdf(src, pct):
                 raise RuntimeError("PDF 有密码，无法按比例缩放")
             if doc.page_count > 2000:
                 raise RuntimeError(f"页数太多（{doc.page_count}），请改用「适合」或「实际大小」")
+            n = doc.page_count
             try:
-                # show_pdf_page 只搬页面内容流，不拍平会丢掉注释和表单域
+                # show_pdf_page 只搬页面内容流，不拍平会丢掉注释和表单域；
+                # 原地缩放更要把注释先烘进内容，否则注释停在原来的位置和大小上
                 doc.bake(annots=True, widgets=True)
             except Exception:
                 pass
             k = pct / 100.0
-            out = fitz.open()
-            try:
-                for pg in doc:
-                    np_ = out.new_page(width=pg.rect.width * k, height=pg.rect.height * k)
-                    np_.show_pdf_page(np_.rect, doc, pg.number)   # 矢量缩放，不重采样
-                data = out.tobytes(deflate=True, garbage=3)
-            finally:
-                out.close()
+            data = None
+            if not any(pg.rotation for pg in doc):
+                try:
+                    data = _fast_rescale(doc, k)
+                except Exception as e:      # 各种畸形页面都不该让打不出来
+                    print("[提示] 快速缩放失败，改用逐页重建:", e)
+            if data is None:
+                data = _slow_rescale(doc, k)
         finally:
             doc.close()
         os.makedirs(CONV_DIR, exist_ok=True)
@@ -270,6 +346,18 @@ def scaled_pdf(src, pct):
                     os.remove(part)
                 except OSError:
                     pass
+        # 校验：页数不对就宁可报错，别拿一份缺页的 PDF 去打印
+        try:
+            with fitz.open(t) as chk:
+                bad = chk.page_count != n
+        except Exception:
+            bad = True
+        if bad:
+            try:
+                os.remove(t)
+            except OSError:
+                pass
+            raise RuntimeError("缩放后的 PDF 校验不通过（页数不符），请改用「适合」打印")
     return t
 
 
@@ -284,6 +372,15 @@ def prune_cache(days=7):
                 os.remove(f.path)
             except OSError:
                 pass
+    # 合并出来的临时 PDF 正常打完就删了，只有进程被杀才会剩下，顺手扫掉
+    if os.path.isdir(MERGE_DIR):
+        live = {j["path"] for j in list(JOBS.values()) if j.get("path")}
+        for f in os.scandir(MERGE_DIR):
+            if f.is_file() and f.path not in live and f.stat().st_mtime < cut:
+                try:
+                    os.remove(f.path)
+                except OSError:
+                    pass
 
 
 # ---------------- 打印效果预览 ----------------
@@ -397,17 +494,32 @@ def preview_png(src, paper, mode="fit", pct=100, page_no=1, gray=False, dpi=120)
 
 
 
-def preflight(path):
-    """读页数 / 尺寸 / 方向。按 mtime+size 缓存，避免每次刷新重解析。"""
+def preflight(path, allow_convert=True):
+    """读页数 / 尺寸 / 方向。按 mtime+size 缓存，避免每次刷新重解析。
+
+    allow_convert=False 是给网页刷新用的：绝不在这里等 WPS 转 PDF，只把没转好的
+    文件标成「转换中」并甩给后台转换线程，界面就不会因为一份 Word 卡住不动。
+    """
     st = os.stat(path)
-    key = (st.st_mtime, st.st_size)
+    stamp = (st.st_mtime, st.st_size)      # 注意别用 key 这个名字，下面还要用
     hit = CACHE.get(path)
-    if hit and hit[0] == key:
+    if hit and hit[0] == stamp:
         return hit[1]
 
     info = {"path": path, "name": os.path.basename(path),
             "kind": KIND.get(ext_of(path)) or ("图片" if ext_of(path) in IMG_EXT else ""),
             "mb": round(st.st_size / 1048576, 2), "mtime": st.st_mtime}
+    if not allow_convert and needs_convert(path):
+        fail = CONV_FAIL.get(path)
+        if fail and fail[0] == stamp:      # 转过了、失败了，别再一遍遍重试
+            info.update({"pages": 0, "size": "—", "orientation": "—", "paper": "A4",
+                         "detail": f"解析失败：{fail[1]}", "error": fail[1]})
+            CACHE[path] = (stamp, info)
+            return info
+        request_convert(path)
+        info.update({"pages": 0, "size": "—", "orientation": "—", "paper": "A4",
+                     "detail": "转换中…", "pending": True})
+        return info                        # 不缓存：转好后要换成真实页数
     try:
         pdf = printable_pdf(path)      # Office/图片在这里转成 PDF
         info["pdf"] = pdf
@@ -418,10 +530,10 @@ def preflight(path):
             r = pg.rect
             w = round(r.width * 25.4 / 72)
             h = round(r.height * 25.4 / 72)
-            key = (classify(w, h) or f"{min(w,h)}×{max(w,h)}mm",
-                   "横向" if w > h else "纵向")
-            pairs[key] += 1
-            exact.setdefault(key, (min(w, h), max(w, h)))
+            sk = (classify(w, h) or f"{min(w,h)}×{max(w,h)}mm",
+                  "横向" if w > h else "纵向")
+            pairs[sk] += 1
+            exact.setdefault(sk, (min(w, h), max(w, h)))
         doc.close()
         sizes = {k[0] for k in pairs}
         orients = {k[1] for k in pairs}
@@ -442,7 +554,7 @@ def preflight(path):
         info.update({"pages": 0, "size": "—", "orientation": "—",
                      "detail": f"解析失败：{e}", "paper": "A4",
                      "error": str(e)})
-    CACHE[path] = (key, info)
+    CACHE[path] = (stamp, info)
     return info
 
 
@@ -454,6 +566,10 @@ def set_hotfolder(path):
         raise ValueError("文件夹不存在：" + path)
     HOT = path
     CFG["hotfolder"] = path
+    CACHE.clear()                       # 换目录了，上一目录的预检/转换状态都作废
+    with CONV_STATE_LOCK:
+        CONV_WANT.clear()
+        CONV_FAIL.clear()
     with open(CFG_PATH, "w", encoding="utf-8") as f:
         json.dump(CFG, f, ensure_ascii=False, indent=2)
     return HOT
@@ -478,6 +594,8 @@ def pick_folder():
 
 
 def list_files():
+    """列热文件夹里能打印的文件。这里只读缓存，不在这里等转换 —— 新丢进来的
+    Word/表格/图片先显示「转换中」，后台线程转好了下一轮刷新就换成真实页数。"""
     out = []
     if not os.path.isdir(HOT):
         return out
@@ -487,13 +605,9 @@ def list_files():
         if (ext_of(name) in OFFICE_EXT or ext_of(name) in IMG_EXT
                 or ext_of(name) == ".pdf") and os.path.isfile(p):
             paths.append(p)
-    try:
-        ensure_pdfs(paths)          # 先把这一批新的 Office 文件一次转完
-    except Exception as e:
-        print("[警告] Office 转换出错:", e)
     for p in paths:
         try:
-            out.append(preflight(p))
+            out.append(preflight(p, allow_convert=False))
         except OSError:
             pass
     out.sort(key=lambda x: -x["mtime"])
@@ -501,10 +615,16 @@ def list_files():
 
 
 # ---------------- 打印队列 ----------------
-QUEUE = queue.Queue()
+# 两道工序分开排队：PREP_Q（转 PDF / 缩放 / 合并）→ READY_Q（送印）。
+# 分开的好处：下单请求立刻返回；打前一份的时候，后一份已经在准备了。
+PREP_Q = queue.Queue()
+READY_Q = queue.Queue()
 JOBS = {}          # id -> job
 JOBS_LOCK = threading.Lock()
 _seq = [0]
+MERGE_DIR = os.path.join(CONV_DIR, "_合并")
+# 还在跑的状态。清空队列遇到这几种要拦住，等打完再说
+ACTIVE_STATES = ("排队中", "准备中", "打印中")
 
 DUPLEX = {"single": "simplex", "long": "duplexlong", "short": "duplexshort"}
 # DMPAPER_* 编号。本机驱动的纸名叫 "A4(210x297mm)"，Sumatra 的 paper=A4 匹配不上
@@ -512,9 +632,89 @@ DUPLEX = {"single": "simplex", "long": "duplexlong", "short": "duplexshort"}
 # 这种纸就落到 A3 —— 233x479mm 的图打成 A3 就是这么来的。paperkind 直接给编号。
 PAPERKIND = {"A4": 9, "A3": 8, "A5": 11, "B4": 12, "B5": 13, "Letter": 1, "Legal": 5, "11x17": 3}
 
+# ---------------- 页码范围 ----------------
+# SumatraPDF 的 -print-settings 原生认页码（5 / 2-6 / 5- / -1 末页），但合并打印会把多份
+# PDF 首尾相接、页号整体后移，所以统一先解析成具体页号，prepare 里按各份页数偏移后再压回
+# "1-3,5" 这种紧凑写法送印。
+_PG_CHAR = str.maketrans({"０": "0", "１": "1", "２": "2", "３": "3", "４": "4", "５": "5",
+                          "６": "6", "７": "7", "８": "8", "９": "9", "，": ",", "、": ",",
+                          "；": ",", ";": ",", "－": "-", "—": "-", "–": "-", "~": "-",
+                          "～": "-"})
+_PG_ONE = re.compile(r"^(-?\d+)$")
+_PG_RANGE = re.compile(r"^(-?\d+)-(-?\d*)$")
+
+
+def parse_pages(spec, total=None):
+    """页码串 -> 升序去重的页号列表；空串表示全部（total 未知时返回 None）。
+
+    total 已知就校验越界并抛 ValueError；不知道总页数（文件还在转）时只校验语法，
+    需要总页数才能解释的写法（5- / 负数）留到 prepare 再算。
+    """
+    s = str(spec or "").strip()
+    if not s:
+        return list(range(1, total + 1)) if total else None
+    t = s.translate(_PG_CHAR)
+    t = re.sub(r"\s*-\s*", "-", t)          # 「1 - 3」也认
+    t = re.sub(r"\s+", ",", t)              # 空格当分隔符
+    nums = set()
+
+    def resolve(v, tok):
+        if v < 0:                            # 负数从末尾数，-1 是最后一页（同 SumatraPDF）
+            if not total:
+                raise ValueError(f"「{tok}」要等页数出来才能算")
+            v = total + v + 1
+        if v < 1:
+            raise ValueError(f"页码不存在：{tok}")
+        if total and v > total:
+            raise ValueError(f"第 {v} 页超出范围（共 {total} 页）")
+        return v
+
+    for tok in [x for x in t.split(",") if x]:
+        if tok.lower() in ("all", "全部", "全部页", "*"):
+            if not total:
+                raise ValueError("「全部」要等页数出来才能算")
+            nums.update(range(1, total + 1))
+        elif _PG_ONE.match(tok):
+            nums.add(resolve(int(tok), tok))
+        elif _PG_RANGE.match(tok):
+            a, b = _PG_RANGE.match(tok).groups()
+            hi = resolve(int(b), tok) if b else total
+            if not hi:
+                raise ValueError(f"「{tok}」要等页数出来才能算")
+            lo = resolve(int(a), tok)
+            nums.update(range(min(lo, hi), max(lo, hi) + 1))
+        else:
+            raise ValueError(f"看不懂的页码：{tok}")
+    if not nums:
+        raise ValueError("没有有效的页码")
+    return sorted(nums)
+
+
+def pages_text(nums):
+    """页号列表 -> "1-3,5"。连着三页以上压成范围，省得参数串太长。"""
+    out, i, nums = [], 0, list(nums)
+    while i < len(nums):
+        j = i
+        while j + 1 < len(nums) and nums[j + 1] == nums[j] + 1:
+            j += 1
+        if j - i >= 2:
+            out.append(f"{nums[i]}-{nums[j]}")
+        else:
+            out.extend(str(x) for x in nums[i:j + 1])
+        i = j + 1
+    return ",".join(out)
+
 
 def build_settings(job):
-    s = [f'{job["copies"]}x', DUPLEX[job["duplex"]]]
+    s = []
+    if job.get("range"):
+        s.append(job["range"])          # 页码放最前，和 SumatraPDF 文档里的示例一致
+    s.append(f'{job["copies"]}x')
+    if job["copies"] > 1:
+        # 显式要「逐份」：一份打完再打下一份。不写就听驱动的默认值，
+        # 有的驱动按页刷（第1页xN、第2页xN…），合并打印会整叠错乱。
+        s.append("collate")
+    s.append(DUPLEX[job["duplex"]])
     s.append("color" if job["color"] else "monochrome")
     kind = PAPERKIND.get(job["paper"])
     s.append(f"paperkind={kind}" if kind else f'paper={job["paper"]}')
@@ -564,9 +764,221 @@ def read_log():
             "total": round(sum(float(r["金额元"]) for r in rows), 2)}
 
 
-def worker():
+def conv_worker():
+    """后台把 Office/图片转成 PDF。攒一小会儿再一起转，一次 PowerShell/WPS 启动搞定一批。"""
     while True:
-        job = QUEUE.get()
+        batch = [CONV_Q.get()]
+        try:
+            while len(batch) < 12:
+                batch.append(CONV_Q.get(timeout=0.15))      # 同一批刚丢进来的凑一次
+        except queue.Empty:
+            pass
+        office = [b for b in batch if ext_of(b) in OFFICE_EXT]
+        if office:
+            try:
+                ensure_pdfs(office)
+            except Exception as e:
+                print("[警告] Office 转换出错:", e)
+        for b in batch:
+            err = ""
+            if ext_of(b) in IMG_EXT:
+                try:
+                    img_to_pdf(b)
+                except Exception as e:
+                    err = f"图片转换失败：{e}"
+            ok = not err and bool(cached_pdf(b))
+            if not ok and not err:
+                err = "转换失败（WPS 没转出 PDF：文件损坏/加密，或 WPS 正弹着对话框）"
+            with CONV_STATE_LOCK:
+                stamp = CONV_WANT.pop(b, None)
+                if ok:
+                    CONV_FAIL.pop(b, None)
+                elif stamp:
+                    CONV_FAIL[b] = (stamp, err)
+            CACHE.pop(b, None)          # 状态变了，下一轮刷新重新解析
+
+
+def merge_pdfs(pdfs):
+    """把多份 PDF 首尾相接写成一份，返回新文件路径。各页尺寸保持不变。"""
+    out = fitz.open()
+    try:
+        for p in pdfs:
+            d = fitz.open(p)
+            try:
+                if d.needs_pass:
+                    raise RuntimeError(f"{os.path.basename(p)} 有密码，无法合并")
+                out.insert_pdf(d)
+            finally:
+                d.close()
+        os.makedirs(MERGE_DIR, exist_ok=True)
+        t = os.path.join(MERGE_DIR, os.urandom(4).hex() + ".pdf")
+        part = t + ".part"                 # 半截文件不会被当成品
+        # garbage=1 只丢没人引用的对象；garbage=3 还要去重、重排，纯浪费（实测慢一倍多，体积一样）
+        out.save(part, deflate=True, garbage=1)
+        os.replace(part, t)
+    finally:
+        out.close()
+    return t
+
+
+# 只有这几项完全相同才能拼成一份打：拼起来就是一次送印，参数只能有一套
+MERGE_KEY = ("printer", "copies", "color", "paper", "duplex", "scale", "pct")
+
+
+def group_jobs(preps):
+    """按送印参数分组。参数不同的各成一组，组内可以拼成一份一次送印。"""
+    groups = {}
+    for p in preps:
+        groups.setdefault(tuple(p[k] for k in MERGE_KEY), []).append(p)
+    return list(groups.values())
+
+
+def _merge_group(ps):
+    """把一组（同参数）的预备任务并成一个任务。真正拼 PDF 留到 prepare 里做，
+    下单请求就不用等合并了。"""
+    if len(ps) == 1:
+        return ps[0]
+    j = dict(ps[0])
+    j["srcs"] = [p["srcs"][0] for p in ps]
+    j["names"] = [p["name"] for p in ps]
+    j["name"] = f'{ps[0]["name"]} 等{len(ps)}份（合并）'
+    j["specs"] = [(p.get("specs") or [""])[0] for p in ps]   # 每份各自的页码，prepare 里按偏移翻译
+    j["range"] = ""                             # 合并后的页码要重算，别留第一份的
+    j["pages"] = sum(p.get("pages") or 0 for p in ps)
+    j["tmp"] = True
+    return j
+
+
+def _validate(it):
+    """只做轻量校验 + 读缓存里的页数，返回下单字段。耗时的转换/缩放/合并留给 prepare。
+
+    pages 可能是 0（文件刚丢进来还没转成 PDF），prepare 时补上真实页数。
+    """
+    path = it.get("path") or os.path.join(HOT, os.path.basename(it.get("name", "")))
+    path = os.path.abspath(path)
+    if os.path.dirname(path) != os.path.abspath(HOT) or not os.path.isfile(path):
+        raise ValueError(f"文件不在热文件夹内: {path}")
+    printer = it.get("printer")
+    if printer not in PRINTERS:
+        raise ValueError(f"打印机不在列表中: {printer}")
+    copies = int(it.get("copies", 1))
+    if not 1 <= copies <= 999:
+        raise ValueError("份数需在 1-999")
+    paper = it.get("paper")
+    if paper not in CFG["papers"]:
+        raise ValueError(f"纸张不在列表中: {paper}")
+    duplex = it.get("duplex", "single")
+    if duplex not in DUPLEX:
+        raise ValueError("双面参数非法")
+    color = bool(it.get("color"))
+    scale = it.get("scale", "fit")
+    if scale not in SCALE:
+        raise ValueError(f"缩放方式非法: {scale}")
+    pct = 100
+    if scale == "custom":
+        try:
+            pct = int(it.get("scale_pct", 100))
+        except (TypeError, ValueError):
+            raise ValueError("自定义比例必须是整数")
+        if not 10 <= pct <= 400:
+            raise ValueError("自定义比例需在 10-400%")
+    # 缓存里已经有解析结果就直接用；还没转好就先当 0 页，别在这里等 WPS
+    info = preflight(path, allow_convert=False)
+    if info.get("error"):
+        raise ValueError(f"{os.path.basename(path)}：{info['detail']}")
+    unit = unit_price(paper, color)
+    total = info.get("pages") or 0
+    # 页码范围：空 = 全部。页数还没解析出来（转换中）就先存原文，prepare 时按真实页数校验
+    spec = str(it.get("pages_spec") or "").strip()
+    pick = parse_pages(spec, total) if spec and total else None
+    pages = len(pick) if pick else total
+    return {"name": os.path.basename(path), "names": [os.path.basename(path)],
+            "srcs": [path], "printer": printer, "copies": copies, "color": color,
+            "paper": paper, "duplex": duplex, "scale": scale, "pct": pct,
+            "specs": [spec], "range": pages_text(pick) if pick else "",
+            "pages": pages, "unit": unit,
+            "amount": round(unit * copies * pages, 2)}
+
+
+def prepare(job):
+    """真正备货：转 PDF、按比例重排、多份合并，最后算出页数和金额。
+
+    这道工序放在后台线程里跑，下单请求不用等它；它和「送印」是两条流水线，
+    所以在打前一份的时候，后面几份就已经在转了。
+    """
+    srcs = job["srcs"]
+    specs = job.get("specs") or [""] * len(srcs)
+    office = [s for s in srcs if ext_of(s) in OFFICE_EXT]
+    if office:
+        ensure_pdfs(office)                   # 一次 PowerShell 启动转一批
+    pdfs, counts = [], []
+    for s in srcs:
+        info = preflight(s)                   # 此刻已经转好，缓存里是真实页数
+        if info.get("error"):
+            raise RuntimeError(f"{os.path.basename(s)}：{info['detail']}")
+        counts.append(info.get("pages") or 0)
+        pdfs.append(info["pdf"])
+    if job["scale"] == "custom" and job["pct"] != 100:
+        pdfs = [scaled_pdf(s, job["pct"]) for s in srcs]   # 用原始文件算缓存名，源一改自动失效
+    job["path"] = merge_pdfs(pdfs) if len(pdfs) > 1 else pdfs[0]
+
+    # 页码：合并后各份的页号整体后移，所以按每份自己的页数翻译成本份内页号再加偏移。
+    # 真页数到这里才准（下单时文件可能还在转），越界也在这里报错，不发出去打。
+    nums, off = [], 0
+    for i, (n, spec) in enumerate(zip(counts, specs)):
+        if spec:
+            try:
+                nums.extend(off + p for p in parse_pages(spec, n))
+            except ValueError as e:
+                raise RuntimeError(f"{os.path.basename(srcs[i])} 页码范围：{e}")
+        else:
+            nums.extend(range(off + 1, off + n + 1))
+        off += n
+    job["pages"] = len(nums)
+    job["range"] = "" if job["pages"] == off else pages_text(nums)   # 全选就不用写页码
+    job["settings"] = build_settings(job)
+    job["amount"] = round(job["unit"] * job["copies"] * job["pages"], 2)
+    return job
+
+
+def enqueue(items, merge=False):
+    """校验后立刻入队，返回 [{id,name,state}]。转换/缩放/合并在后台做，请求马上返回。
+
+    merge=True 时同参数的文件归成一组，等准备阶段再拼成一份 PDF 一次送印。
+    """
+    preps = [_validate(it) for it in items]
+    jobs = [_merge_group(g) for g in group_jobs(preps)] if merge else preps
+    ok = []
+    for p in jobs:
+        _seq[0] += 1
+        job = {"id": _seq[0], "state": "排队中", "msg": "", **p}
+        job["settings"] = build_settings(job)
+        with JOBS_LOCK:
+            JOBS[job["id"]] = job
+        PREP_Q.put(job)
+        ok.append({"id": job["id"], "name": job["name"], "names": job["names"],
+                   "state": job["state"], "settings": job["settings"]})
+    return ok
+
+
+def prep_worker():
+    while True:
+        job = PREP_Q.get()
+        job["state"] = "准备中"
+        try:
+            prepare(job)
+            job["state"] = "排队中"
+            READY_Q.put(job)
+        except Exception as e:
+            job["state"] = "失败"
+            job["msg"] = str(e)
+            job["end"] = time.time()
+
+
+def print_worker():
+    """严格按顺序送印（SumatraPDF 是单实例的，并发反而会打乱顺序）。"""
+    while True:
+        job = READY_Q.get()
         job["state"] = "打印中"
         job["start"] = time.time()
         args = [SUMATRA, "-print-to", job["printer"],
@@ -587,77 +999,96 @@ def worker():
             job["state"] = "失败"
             job["msg"] = str(e)
         job["end"] = time.time()
-
-
-threading.Thread(target=worker, daemon=True).start()
-
-
-def enqueue(items):
-    """校验后入队，返回 [{id,name,state}]。"""
-    ok = []
-    for it in items:
-        path = it.get("path") or os.path.join(HOT, os.path.basename(it.get("name", "")))
-        path = os.path.abspath(path)
-        if os.path.dirname(path) != os.path.abspath(HOT) or not os.path.isfile(path):
-            raise ValueError(f"文件不在热文件夹内: {path}")
-        printer = it.get("printer")
-        if printer not in PRINTERS:
-            raise ValueError(f"打印机不在列表中: {printer}")
-        copies = int(it.get("copies", 1))
-        if not 1 <= copies <= 999:
-            raise ValueError("份数需在 1-999")
-        paper = it.get("paper")
-        if paper not in CFG["papers"]:
-            raise ValueError(f"纸张不在列表中: {paper}")
-        duplex = it.get("duplex", "single")
-        if duplex not in DUPLEX:
-            raise ValueError("双面参数非法")
-        color = bool(it.get("color"))
-        scale = it.get("scale", "fit")
-        if scale not in SCALE:
-            raise ValueError(f"缩放方式非法: {scale}")
-        pct = 100
-        if scale == "custom":
+        if job.get("tmp"):            # 合并出来的临时 PDF 打完就没用了
             try:
-                pct = int(it.get("scale_pct", 100))
-            except (TypeError, ValueError):
-                raise ValueError("自定义比例必须是整数")
-            if not 10 <= pct <= 400:
-                raise ValueError("自定义比例需在 10-400%")
-        info = preflight(path)
-        if info.get("error"):
-            raise ValueError(f"{os.path.basename(path)}：{info['detail']}")
-        pdf = info["pdf"]
-        if scale == "custom" and pct != 100:
-            try:
-                pdf = scaled_pdf(path, pct)      # 用原始文件算缓存名，源一改自动失效
-            except Exception as e:
-                raise ValueError(f"{os.path.basename(path)}：{e}")
-        pages = info["pages"]
-        unit = unit_price(paper, color)
-        _seq[0] += 1
-        job = {"id": _seq[0], "name": os.path.basename(path), "path": pdf,
-               "printer": printer, "copies": copies, "color": color,
-               "paper": paper, "duplex": duplex, "scale": scale, "pct": pct,
-               "state": "排队中", "msg": "",
-               "pages": pages, "unit": unit,
-               "amount": round(unit * copies * pages, 2)}
-        job["settings"] = build_settings(job)
-        with JOBS_LOCK:
-            JOBS[job["id"]] = job
-        QUEUE.put(job)
-        ok.append({"id": job["id"], "name": job["name"], "settings": job["settings"]})
-    return ok
+                os.remove(job["path"])
+            except OSError:
+                pass
+
+
+for _t in (conv_worker, prep_worker, print_worker):
+    threading.Thread(target=_t, daemon=True).start()
 
 
 def recent_jobs():
     with JOBS_LOCK:
         js = sorted(JOBS.values(), key=lambda j: -j["id"])[:80]
-        return [{k: v for k, v in j.items() if k != "path"} for j in js]
+        return [{k: v for k, v in j.items() if k not in ("path", "srcs")} for j in js]
+
+
+# ---------------- 清空队列 ----------------
+
+def recycle(paths):
+    """把文件送进回收站（可还原），返回没能删掉的路径。"""
+    import ctypes
+    from ctypes import wintypes
+
+    class OP(ctypes.Structure):
+        _fields_ = [("hwnd", wintypes.HWND), ("wFunc", wintypes.UINT),
+                    ("pFrom", wintypes.LPCWSTR), ("pTo", wintypes.LPCWSTR),
+                    ("fFlags", ctypes.c_ushort), ("aborted", wintypes.BOOL),
+                    ("hNameMappings", ctypes.c_void_p),
+                    ("lpszProgressTitle", wintypes.LPCWSTR)]
+
+    # FOF_ALLOWUNDO|NOCONFIRMATION|SILENT|NOERRORUI，wFunc=3 是 FO_DELETE
+    op = OP(None, 3, "\0".join(paths) + "\0\0", None, 0x40 | 0x10 | 0x04 | 0x400,
+            False, None, None)
+    ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
+    return [p for p in paths if os.path.exists(p)]    # 还在盘上的就是没删掉
+
+
+def clear_files(names):
+    """清空队列：删掉热文件夹里这些文件（进回收站），连带它们的缓存 PDF
+    和打剩的合并临时文件。只认名单里的文件名，热文件夹里别的东西不碰。"""
+    root = os.path.abspath(HOT)
+    paths = []
+    for n in names:
+        p = os.path.abspath(os.path.join(root, os.path.basename(n)))
+        if os.path.dirname(p) != root:
+            raise ValueError(f"文件不在热文件夹内: {p}")
+        if os.path.isfile(p):
+            paths.append(p)
+    if not paths:
+        return {"removed": 0, "cache": 0, "merged": 0, "failed": []}
+    live = [j for j in list(JOBS.values()) if j["state"] in ACTIVE_STATES]
+    want = {os.path.basename(p) for p in paths}
+    # 合并任务的名字是一串「a.pdf 等N份」，所以按任务的 names 判断有没有在打
+    busy = [n for j in live for n in j.get("names") or [] if n in want]
+    if busy:
+        raise ValueError("还有任务在打，等打完再清：" + "、".join(busy[:3]))
+
+    cache = 0
+    for p in paths:
+        t = conv_target(p)
+        # 缓存名是 名字_大小_时间.pdf，自定义比例再带 _s{pct}。只清这一份的，同名的别的文件不误伤
+        for f in [t] + glob.glob(t[:-4] + "_s*.pdf"):
+            if os.path.isfile(f):
+                try:
+                    os.remove(f)
+                    cache += 1
+                except OSError:
+                    pass
+    merged = 0
+    inuse = {j["path"] for j in live if j.get("path")}   # 正在打的那份合并 PDF 不能删
+    if os.path.isdir(MERGE_DIR):
+        for f in os.scandir(MERGE_DIR):
+            if f.is_file() and f.path not in inuse:
+                try:
+                    os.remove(f.path)
+                    merged += 1
+                except OSError:
+                    pass
+    failed = recycle(paths)
+    return {"removed": len(paths) - len(failed), "cache": cache, "merged": merged,
+            "failed": [os.path.basename(p) for p in failed]}
 
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "LinkPrint"
+    # 长连接：前端每秒轮询状态，不用每次都重新 TCP 握手/关闭（Windows 上还会留一堆
+    # TIME_WAIT）。每个响应都带 Content-Length，所以 1.1 的 keep-alive 是安全的。
+    protocol_version = "HTTP/1.1"
+    timeout = 120          # 空闲连接最多挂 2 分钟，超了就关，别攒线程
 
     def log_message(self, *a):
         pass
@@ -745,12 +1176,16 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(404, {"error": "not found"})
 
     def do_POST(self):
-        if urlparse(self.path).path != "/api/print":
-            return self._send(404, {"error": "not found"})
+        p = urlparse(self.path).path
         try:
             n = int(self.headers.get("Content-Length", 0))
             data = json.loads(self.rfile.read(n) or b"{}")
-            return self._send(200, {"queued": enqueue(data.get("jobs", []))})
+            if p == "/api/print":
+                return self._send(200, {"queued": enqueue(data.get("jobs", []),
+                                                          bool(data.get("merge")))})
+            if p == "/api/clear":
+                return self._send(200, clear_files(data.get("names", [])))
+            return self._send(404, {"error": "not found"})
         except Exception as e:
             return self._send(400, {"error": str(e)})
 
