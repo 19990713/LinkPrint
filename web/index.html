@@ -709,11 +709,30 @@ $('#tbody').addEventListener('change', e=>{
   updateStat();
 });
 
+// 点行空白处选中/取消选中：落在有功能的元素上（链接、输入框、下拉框、按钮、勾选框）
+// 不触发，其余空白处（td/span/b/div 等）切换该行选中，同样支持 Shift 连选。
 $('#tbody').addEventListener('click', e=>{
-  const act = e.target.dataset.act, tr = e.target.closest('tr');
-  if (!act || !tr) return;
-  if (act === 'pv') openPv(tr.dataset.n);
-  else if (act === 'one') send([tr.dataset.n]);
+  const tr = e.target.closest('tr');
+  if (!tr) return;
+  const act = e.target.dataset.act;
+  if (act){                                          // 预览/打印按钮
+    if (act === 'pv') openPv(tr.dataset.n);
+    else if (act === 'one') send([tr.dataset.n]);
+    return;
+  }
+  // 落在功能元素上不动（勾选框走原生 change，链接跳转，输入框/下拉框各自编辑）
+  if (e.target.closest('a, input, select, button')) return;
+  const idx = FILES.findIndex(f => f.name === tr.dataset.n);
+  if (idx < 0) return;
+  const want = !ROWS[tr.dataset.n].sel;
+  if (e.shiftKey && lastSel >= 0 && idx !== lastSel){
+    const lo = Math.min(lastSel, idx), hi = Math.max(lastSel, idx);
+    for (let i = lo; i <= hi; i++) ROWS[FILES[i].name].sel = want;
+  } else {
+    ROWS[tr.dataset.n].sel = want;
+    lastSel = idx;
+  }
+  render();
 });
 
 // Shift 连选：在 mousedown 里记下「这次点击是否按住 Shift」，change 里再据此连选。
