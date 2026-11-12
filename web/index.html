@@ -269,6 +269,7 @@ let PREV = {};       // job id -> 上次看到的状态
 let SIG = '';
 let DEF = {printer:'', copies:1, color:0, paper:'A4', duplex:'single', scale:'fit', pct:100, nup:1};
 let lastSel = -1;    // Shift 连选的锚点：上次点击（或区间起点）在 FILES 里的索引
+let shiftClick = false;   // 本次勾选点击是否按住 Shift（mousedown 里记）
 
 const $ = s => document.querySelector(s);
 const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -662,7 +663,19 @@ $('#modal').addEventListener('click', e=>{ if (e.target.id === 'modal') closeLog
 $('#tbody').addEventListener('change', e=>{
   const tr = e.target.closest('tr'); if (!tr) return;
   const s = ROWS[tr.dataset.n]; if (!s) return;
-  if (e.target.classList.contains('c-sel')) s.sel = e.target.checked;
+  if (e.target.classList.contains('c-sel')){
+    const idx = FILES.findIndex(f => f.name === tr.dataset.n);
+    const want = e.target.checked;                 // change 时 checked 已更新为本次点击后的值
+    if (shiftClick && lastSel >= 0 && idx >= 0 && idx !== lastSel){
+      // 按住 Shift 连选：把 [锚点, 当前] 区间统一设为本框的状态，再整表重画
+      const lo = Math.min(lastSel, idx), hi = Math.max(lastSel, idx);
+      for (let i = lo; i <= hi; i++) ROWS[FILES[i].name].sel = want;
+      render();
+      return;
+    }
+    s.sel = want;
+    lastSel = idx;
+  }
   else if (e.target.classList.contains('c-printer')){
     s.printer = e.target.value;
     s.color = isColorMachine(s.printer) ? 1 : 0;
@@ -697,28 +710,18 @@ $('#tbody').addEventListener('change', e=>{
 });
 
 $('#tbody').addEventListener('click', e=>{
-  // 勾选框：支持单击 + Shift 连选（按住 Shift 点另一个，中间所有行一起选中）
-  const box = e.target.closest('input.c-sel');
-  if (box){
-    const tr = box.closest('tr');
-    const idx = FILES.findIndex(f => f.name === tr.dataset.n);
-    if (idx < 0) return;
-    const target = !box.checked;                    // 本次点击后的目标状态
-    if (e.shiftKey && lastSel >= 0 && idx !== lastSel){
-      const lo = Math.min(lastSel, idx), hi = Math.max(lastSel, idx);
-      for (let i = lo; i <= hi; i++) ROWS[FILES[i].name].sel = target;
-    } else {
-      ROWS[tr.dataset.n].sel = target;
-      lastSel = idx;
-    }
-    render();
-    e.preventDefault();                            // 阻止浏览器默认勾选，状态已由 render 统一
-    return;
-  }
   const act = e.target.dataset.act, tr = e.target.closest('tr');
   if (!act || !tr) return;
   if (act === 'pv') openPv(tr.dataset.n);
   else if (act === 'one') send([tr.dataset.n]);
+});
+
+// Shift 连选：在 mousedown 里记下「这次点击是否按住 Shift」，change 里再据此连选。
+// 单选仍走浏览器原生的勾选 → change 事件，绝不失效。
+$('#tbody').addEventListener('mousedown', e=>{
+  const box = e.target.closest('input.c-sel');
+  if (!box) return;
+  shiftClick = e.shiftKey;
 });
 
 // ---------------- 预览 ----------------
