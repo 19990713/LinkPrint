@@ -138,6 +138,7 @@
   <button class="mini" onclick="openFolder()">打开文件夹</button>
   <div class="grow"></div>
   <button class="mini" onclick="openPvAll()" title="在一个窗口里连续翻看所有文件的每一页">全部预览</button>
+  <button class="mini" onclick="openPvMerge()" title="把勾选的文件合并后再多页拼版，预览拼到同一张纸上的效果">拼版预览</button>
   <button onclick="refresh(true)">刷新</button>
   <button class="primary" id="btnAll" onclick="printAll()">全部发出打印</button>
 </header>
@@ -757,8 +758,38 @@ function openPvAll(){
   setPvTab('effect');
 }
 
+// 「拼版预览」：把勾选的文件合并后再多页拼版，预览拼到同一张纸上的效果。
+// 需要勾选 ≥2 个文件、且每行的「每页张数」一致（拼版参数不同没法拼一起）。
+function openPvMerge(){
+  const list = FILES.filter(f => ROWS[f.name].sel && !f.error && !f.pending);
+  if (list.length < 2) return toast('拼版预览需要至少勾选 2 个文件', true);
+  const nup = ROWS[list[0].name].nup || 1;
+  if (nup <= 1) return toast('拼版预览需要每页张数 > 1（先在各行选 2/4/6/9/16 页）', true);
+  // 拼版参数必须一致：纸张、每页张数、色彩、缩放都相同才能拼成一份
+  const s0 = ROWS[list[0].name];
+  const bad = list.find(f => {
+    const s = ROWS[f.name];
+    return s.paper !== s0.paper || (s.nup||1) !== nup
+        || !!s.color !== !!s0.color || s.scale !== s0.scale;
+  });
+  if (bad) return toast(`「${bad.name}」的纸张/每页张数/色彩/缩放与其它不一致，无法拼成同一张纸，请先统一`, true);
+  const totalPages = list.reduce((a, f) => a + (f.pages || 0), 0);
+  PVQ = [];
+  PV = {multi:true, names:list.map(f=>f.name), nup, page:1,
+        pages:Math.ceil(totalPages / nup), tab:'effect', req:0, obj:'', s:s0, i:0};
+  wheelAcc = 0; wheelLock = 0;
+  gestureDone = false; lastWheelAt = 0;
+  $('#pvFrame').src = 'about:blank';
+  $('#pv').classList.add('show');
+  setPvTab('effect');
+}
+
 function setPvTab(tab){
   PV.tab = tab;
+  // 跨文件拼版预览没有单一「原文件」，只留「打印效果」这一档
+  const rawBtn = $('#pvTabs').querySelector('button[data-tab="raw"]');
+  rawBtn.style.display = PV.multi ? 'none' : '';
+  if (PV.multi) tab = 'effect';
   for (const b of $('#pvTabs').querySelectorAll('button'))
     b.classList.toggle('on', b.dataset.tab === tab);
   const eff = tab === 'effect';
@@ -771,6 +802,7 @@ function setPvTab(tab){
 
 // 每次翻页向后端要一张「整张纸」的图；响应头带回真实缩放比和纸张尺寸
 function loadEffect(){
+  if (PV.multi) return loadEffectMulti();
   const it = PVQ[PV.i];                      // 全部预览：当前这一页属于哪个文件
   const name = it ? it.n : PV.name;
   const p = it ? it.p : PV.page;
@@ -796,14 +828,20 @@ function loadEffect(){
     : `第 ${p} ${unit} / 共 ${pages} ${unit}`;
   $('#pvImg').style.opacity = .35;
   $('#pvWarn').textContent = '';
-  fetch('/api/printpreview?' + q).then(async r => {
+  fetchPvImg('/api/printpreview?' + q, id);
+}
+
+// 拉一张「整张纸」的预览图并挂到界面。单文件/全部预览/跨文件拼版三种模式共用，
+// 只有请求的 URL 不同。stale 错误（服务是旧版没这个接口）单独处理，退回原文件。
+function fetchPvImg(url, id){
+  fetch(url).then(async r => {
     if (!r.ok){
       let msg = '渲染失败';
       try { msg = (await r.json()).error || msg; } catch(e){}
       // 404 + not found 只可能是后端还没有这个接口（服务没重启、跑的是旧代码），
       // 不是这份文件的问题，别让用户以为文件坏了。
       if (r.status === 404 && msg === 'not found')
-        throw Object.assign(new Error('当前打印服务是旧版本，没有「打印效果」接口，'
+        throw Object.assign(new Error('当前打印服务是旧版本，没有这个预览接口，'
           + '请关掉那个黑窗口重新双击「启动打印系统.bat」'), {stale: true});
       throw new Error(msg);
     }
@@ -831,6 +869,21 @@ function loadEffect(){
     }
     $('#pvWarn').textContent = '⚠ ' + err.message;
   });
+}
+
+// 跨文件拼版预览：把勾选的多个文件合并 + nup 拼版后渲染第 PV.page 张纸。
+function loadEffectMulti(){
+  const s = PV.s || {paper:'A4', color:0};
+  const nup = PV.nup || 1;
+  const id = ++PV.req;
+  $('#pvTitle').textContent = `拼版预览 · ${PV.names.length} 个文件`;
+  $('#pvMeta').textContent = `${s.paper} · 每张 ${nup} 页 · ${s.color ? '彩色' : '黑白'}`;
+  $('#pvPage').textContent = `第 ${PV.page} 张 / 共 ${PV.pages} 张`;
+  $('#pvImg').style.opacity = .35;
+  $('#pvWarn').textContent = '';
+  const q = new URLSearchParams({names: PV.names.join(','), paper: s.paper,
+                                 nup, page: PV.page, gray: s.color ? 0 : 1, dpi:130});
+  fetchPvImg('/api/preview-multi?' + q, id);
 }
 
 function closePv(){

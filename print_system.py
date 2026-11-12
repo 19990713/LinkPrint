@@ -612,6 +612,34 @@ def preview_png(src, paper, mode="fit", pct=100, page_no=1, gray=False, dpi=120,
     return png, meta
 
 
+def preview_multi(names, paper, nup, page_no=1, gray=False, dpi=120):
+    """把多个文件首尾相接、再按 nup 拼版，渲染第 page_no 张纸。跨文件多页预览用。
+
+    复用 preview_png：先把多份 PDF 合并成一份临时 PDF，再让 nup 拼版作用于它。
+    返回 (png bytes, meta)。"""
+    names = [os.path.basename(n) for n in names]
+    pdfs = []
+    for n in names:
+        fp = os.path.join(HOT, n)
+        if not os.path.isfile(fp):
+            raise RuntimeError(f"文件不存在：{n}")
+        info = preflight(fp)
+        if info.get("error"):
+            raise RuntimeError(f"{n}：{info['detail']}")
+        pdfs.append(info["pdf"])
+    if not pdfs:
+        raise RuntimeError("没有可预览的文件")
+    merged = merge_pdfs(pdfs) if len(pdfs) > 1 else pdfs[0]
+    try:
+        return preview_png(merged, paper, "fit", 100, page_no, gray, dpi, nup)
+    finally:
+        if len(pdfs) > 1 and os.path.isfile(merged):
+            try:
+                os.remove(merged)
+            except OSError:
+                pass
+
+
 
 def preflight(path, allow_convert=True):
     """读页数 / 尺寸 / 方向。按 mtime+size 缓存，避免每次刷新重解析。
@@ -1320,6 +1348,24 @@ class Handler(BaseHTTPRequestHandler):
                     float(g("pct", "100")), int(g("page", "1")),
                     g("gray", "0") in ("1", "true"), int(g("dpi", "120")),
                     int(g("nup", "1")))
+            except Exception as e:
+                return self._send(400, {"error": str(e)})
+            return self._send(200, png, "image/png", {
+                "X-LP-Pct": meta["pct"], "X-LP-Rot": meta["rot"],
+                "X-LP-Page": meta["page"], "X-LP-Pages": meta["pages"],
+                "X-LP-W": meta["w"], "X-LP-H": meta["h"],
+                "X-LP-Over": 1 if meta["over"] else 0})
+        if p == "/api/preview-multi":
+            q = parse_qs(u.query)
+            g = lambda k, d: (q.get(k) or [d])[0]
+            names = [n for n in g("names", "").split(",") if n.strip()]
+            if not names:
+                return self._send(404, {"error": "没有指定文件"})
+            try:
+                png, meta = preview_multi(
+                    names, g("paper", "A4"), int(g("nup", "1")),
+                    int(g("page", "1")),
+                    g("gray", "0") in ("1", "true"), int(g("dpi", "120")))
             except Exception as e:
                 return self._send(400, {"error": str(e)})
             return self._send(200, png, "image/png", {
