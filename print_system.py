@@ -1236,17 +1236,10 @@ def send_gdi(job):
             "--color", "1" if job["color"] else "0"]
     if job.get("range"):
         args += ["--range", job["range"]]
-    args += ["--oversize", CFG.get("oversize", "shrink")]
     r = subprocess.run(args, capture_output=True, timeout=600,
                        creationflags=0x08000000)
     if r.returncode == 0:
-        # 成功也可能带提示（图纸比纸大、被自动缩小之类），交给页面显示
-        warn = ""
-        try:
-            warn = (json.loads(r.stdout.decode("utf-8", "ignore") or "{}").get("warn") or "")
-        except Exception:
-            pass
-        return True, warn, False
+        return True, "", False
     msg = _first_line(r.stderr) or f"送印失败（退出码 {r.returncode}）"
     return False, msg, r.returncode == 2
 
@@ -1264,16 +1257,12 @@ def print_job(job):
                 ok, msg2 = send_sumatra(job)
                 if ok:
                     print(f"[提示] {job['name']} GDI 送印失败（{msg}），已改用 SumatraPDF")
-                    job["msg"] = f"GDI 送印失败，已改用 SumatraPDF 完成送印"
-                    msg = ""
                 else:
                     msg = f"{msg}；{msg2}"
         else:
             ok, msg = send_sumatra(job)
         if ok:
             job["state"] = "完成"
-            if msg:
-                job["msg"] = msg      # 打成功但有提示（如自动缩小），留给页面 hover 看
             log_job(job)              # 只有真正送印成功才记账
         else:
             job["state"] = "失败"

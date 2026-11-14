@@ -395,35 +395,3 @@ if ps.PRINTER_Q:
     else:
         assert len(ps.PRINT_QUEUES) == 1, "串行模式应该只有一条队列"
     print("送印队列 OK")
-
-
-# ---------------- 超大图：分带与纸面裁剪 ----------------
-# 「实际大小」打 1261mm 图纸到 A3 只会出左上角一张，是"内容不全"的主因。
-# 这里验两件事：分带既不留缝也不重复；纸面裁剪算得对。
-assert ps.CFG.get("oversize", "shrink") in ("shrink", "clip"), ps.CFG.get("oversize")
-if ps.gdi_print:
-    def _check_bands(bw, bh, dw, dh, paper_w, paper_h, tag):
-        x, y = (paper_w - dw) // 2, (paper_h - dh) // 2
-        L, T = max(0, x), max(0, y)
-        R, B = min(paper_w, x + dw), min(paper_h, y + dh)
-        bands = ps.gdi_print.plan_bands(x, y, dw, dh, L, T, R, B, bw, bh)
-        assert bands, tag + "：应当有分带"
-        dy = T
-        sy = 0
-        for dx, bdy, bdw, bdh, sx, bsy, bsw, bsh in bands:
-            assert bdy == dy, f"{tag}：目标带不连续 {bdy} != {dy}"     # 不留缝、不重叠
-            assert bsy >= sy and bsh > 0, f"{tag}：源行倒流 {bsy} < {sy}"
-            assert dx == L and bdw == R - L, tag + "：横向落位不对"
-            dy += bdh
-            sy = bsy + bsh
-        assert dy == B, f"{tag}：纵向没铺满 {dy} != {B}"
-        return bands
-
-    # 1:1 原尺寸，纸正好装下
-    _check_bands(1000, 1400, 1000, 1400, 1000, 1400, "1:1")
-    # 放大 2 倍，纸只装得下一部分（裁剪）
-    _check_bands(1000, 1400, 2000, 2800, 1200, 1600, "放大裁剪")
-    # 居中后左右各超出（负坐标）
-    _check_bands(4000, 2000, 4400, 2200, 3000, 2400, "四周溢出")
-    print(f"分带/裁剪 OK  （每带 {ps.gdi_print.BAND_ROWS} 行，超过纸面 "
-          f"{ps.gdi_print.OVER_TOL:.2f} 倍才自动缩小）")
