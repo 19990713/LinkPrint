@@ -362,7 +362,7 @@ finally:
 
 
 # ---------------- GDI 送印引擎 ----------------
-assert ps.ENGINE in ("gdi", "sumatra"), ps.ENGINE
+assert ps.ENGINE == "gdi", ps.ENGINE          # 只剩 GDI 一条送印通道
 # 纸型编号两张表必须一致（gdi_print 自己带一份，免得为了一个常量反向依赖）
 if ps.gdi_print:
     assert ps.PAPERKIND == ps.gdi_print.PAPER_ID, (ps.PAPERKIND, ps.gdi_print.PAPER_ID)

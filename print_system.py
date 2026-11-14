@@ -36,11 +36,8 @@ DEFAULT_CFG = {
     # 按关键字匹配本机打印机名，改名换关键词即可
     "printers": ["D95", "D125", "C7580"],
     "papers": ["A4", "A3"],
-    "sumatra": "SumatraPDF.exe",
-    # 送印引擎：gdi = 自己走 GDI（快，实测 7 页从 54s 降到 2s 量级）；sumatra = 老办法
+    # 送印引擎只有 GDI 一种（gdi_print.py）。实测 7 页讲义 2.3s，旧版 SumatraPDF 要 53.9s
     "engine": "gdi",
-    # gdi 引擎在「还没往打印机送任何数据」的失败下，自动换 sumatra 再试一次
-    "engine_fallback": True,
     # 不同打印机之间并行送印（同一台机器仍然严格按顺序，不会乱）
     "print_parallel": True,
     # Office -> PDF 转换器（WPS COM）。找不到它就只支持 PDF
@@ -75,10 +72,6 @@ CFG = load_cfg()
 HOT = CFG["hotfolder"]
 if not os.path.isabs(HOT):
     HOT = os.path.join(BASE, HOT)
-SUMATRA = CFG["sumatra"]
-if not os.path.isabs(SUMATRA):
-    SUMATRA = os.path.join(BASE, SUMATRA)
-
 # Office 文件靠 Convert2PDF.ps1（WPS/Office COM）转 PDF，程序目录里有同名文件就优先用它
 C2P = CFG["convert2pdf"]
 if not os.path.isfile(C2P) and os.path.isfile(os.path.join(BASE, "Convert2PDF.ps1")):
@@ -86,18 +79,22 @@ if not os.path.isfile(C2P) and os.path.isfile(os.path.join(BASE, "Convert2PDF.ps
 POWERSHELL = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
 CONV_DIR = os.path.join(BASE, "_转换缓存")
 
-# 送印引擎。gdi_print.py 直接用 Windows GDI 把位图交给驱动：实测同一份 7 页讲义，
-# SumatraPDF 要 53.9s（其中它自己 CPU 只用了 1.7s，基本在干等），走 GDI 只要 2.3s。
+# 送印只有一条路：gdi_print.py 直接用 Windows GDI 把位图交给驱动。
+# 实测同一份 7 页讲义，旧版走 SumatraPDF 要 53.9s（其中它自己 CPU 只用了 1.7s，基本在干等），
+# 改 GDI 后 2.3s。SumatraPDF 已于 2026-11-14 从本项目和依赖里彻底移除。
 try:
     import gdi_print
-except Exception as _e:                      # 缺 numpy 之类，退回 SumatraPDF
+except Exception as _e:
     gdi_print = None
-    print("[提示] gdi_print 不可用，送印改用 SumatraPDF：", _e)
+    raise SystemExit(f"送印模块 gdi_print 导入失败：{_e}\n"
+                     f"这是唯一的送印通道，先装依赖再启动："
+                     f"pip install pymupdf numpy pywin32")
 
-ENGINE = str(CFG.get("engine", "gdi")).lower()
-if ENGINE == "gdi" and (gdi_print is None or not gdi_print.available()):
-    print("[提示] 当前环境不支持 GDI 送印，自动改用 SumatraPDF")
-    ENGINE = "sumatra"
+ENGINE = "gdi"
+# 不再降级到别的引擎：GDI 不可用时直接报错退出，免得"能点打印但打不出来"
+if not gdi_print.available():
+    raise SystemExit("当前环境不支持 GDI 送印（需要 Windows + numpy），无法启动打印服务。\n"
+                     "修复：pip install numpy pymupdf pywin32")
 
 
 def resolve_printers(keywords):
@@ -153,7 +150,7 @@ OFFICE_EXT = set(KIND)
 IMG_EXT = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp", ".gif"}
 CONV_LOCK = threading.Lock()
 
-# 页面缩放：前三档是 SumatraPDF 原生参数；custom 没有原生支持，
+# 页面缩放：前三档直接决定送印时的排法；custom（自定义比例）没有原生支持，
 # 先用 PyMuPDF 把页面按比例重排成新 PDF，再按 noscale 打
 SCALE = {"fit": "fit", "shrink": "shrink", "noscale": "noscale", "custom": "noscale"}
 SCALE_LOCK = threading.Lock()
@@ -356,7 +353,7 @@ def scaled_pdf(src, pct):
             f.write(data)
         try:
             os.replace(part, t)
-        except OSError:             # Sumatra 正读着同名文件时会拒绝替换，已有就复用
+        except OSError:             # 转换器/阅读器正读着同名文件时会拒绝替换，已有就复用
             if not os.path.isfile(t):
                 raise
         finally:
@@ -382,7 +379,7 @@ def scaled_pdf(src, pct):
 
 # ---------------- 多页（N-up） ----------------
 # 把 N 页缩印到一张纸上，和 Acrobat Reader 打印对话框的「每页张数」一个意思。
-# SumatraPDF 命令行没有 N-up 参数，所以和自定义比例一样：先用 PyMuPDF 拼成
+# 送印层只按 1 页 1 张纸处理，所以 N-up 和自定义比例一样：先用 PyMuPDF 拼成
 # 每张纸一份页面的新 PDF（缓存名带 _nup{N}），再按 noscale 送印。
 NUP_GRID = {1: (1, 1), 2: (1, 2), 4: (2, 2), 6: (2, 3), 9: (3, 3), 16: (4, 4)}
 
@@ -516,10 +513,11 @@ def paper_mm(paper):
 
 
 def print_layout(page_w, page_h, paper, mode="fit", pct=100, margin_mm=None):
-    """模拟 SumatraPDF 的排版规则，返回 (旋转角, 缩放比, 目标矩形, 是否超出纸面)。
+    """预览用的排版规则（与 gdi_print 送印时的排法一致），返回
+    (旋转角, 缩放比, 目标矩形, 是否超出纸面)。
 
-    坐标用 pt、原点在纸张左上角。规则对应 build_settings 发出的参数：
-    - 自动旋转：页面与纸张的横竖方向不一致就转 90°（Sumatra 的行为）
+    坐标用 pt、原点在纸张左上角。
+    - 自动旋转：页面与纸张的横竖方向不一致就转 90°
     - fit：缩放到「纸张减去不可打印边距」，可缩也可放大
     - shrink：同上但只缩不放，小页面维持 100%
     - noscale：固定 100%
@@ -807,14 +805,13 @@ else:
 PRINT_QUEUES = list(dict.fromkeys(PRINTER_Q.values())) or [queue.Queue()]
 
 DUPLEX = {"single": "simplex", "long": "duplexlong", "short": "duplexshort"}
-# DMPAPER_* 编号。本机驱动的纸名叫 "A4(210x297mm)"，Sumatra 的 paper=A4 匹配不上
-# （它只认完整同名或 "A4 " 带空格前缀），会退回"按文档尺寸自定义纸张"，驱动找不到
-# 这种纸就落到 A3 —— 233x479mm 的图打成 A3 就是这么来的。paperkind 直接给编号。
-# 这张表只在 SumatraPDF 兜底时才用；gdi_print 里有一份同样的（自检会比对两份是否一致）。
+# DMPAPER_* 编号。本机驱动的纸名叫 "A4(210x297mm)"，按名字匹配容易落空、最后落到 A3
+# —— 233x479mm 的图打成 A3 就是这么来的，所以统一用编号指定纸张。
+# gdi_print 里有一份同样的表（自检会比对两份是否一致）。
 PAPERKIND = {"A4": 9, "A3": 8, "A5": 11, "B4": 12, "B5": 13, "Letter": 1, "Legal": 5, "11x17": 3}
 
 # ---------------- 页码范围 ----------------
-# SumatraPDF 的 -print-settings 原生认页码（5 / 2-6 / 5- / -1 末页），但合并打印会把多份
+# 页码写法沿用老格式（5 / 2-6 / 5- / -1 末页），但合并打印会把多份
 # PDF 首尾相接、页号整体后移，所以统一先解析成具体页号，prepare 里按各份页数偏移后再压回
 # "1-3,5" 这种紧凑写法送印。
 _PG_CHAR = str.maketrans({"０": "0", "１": "1", "２": "2", "３": "3", "４": "4", "５": "5",
@@ -840,7 +837,7 @@ def parse_pages(spec, total=None):
     nums = set()
 
     def resolve(v, tok):
-        if v < 0:                            # 负数从末尾数，-1 是最后一页（同 SumatraPDF）
+        if v < 0:                            # 负数从末尾数，-1 是最后一页
             if not total:
                 raise ValueError(f"「{tok}」要等页数出来才能算")
             v = total + v + 1
@@ -889,7 +886,7 @@ def pages_text(nums):
 def build_settings(job):
     s = []
     if job.get("range"):
-        s.append(job["range"])          # 页码放最前，和 SumatraPDF 文档里的示例一致
+        s.append(job["range"])          # 页码放最前，便于人读
     s.append(f'{job["copies"]}x')
     if job["copies"] > 1:
         # 显式要「逐份」：一份打完再打下一份。不写就听驱动的默认值，
@@ -899,9 +896,8 @@ def build_settings(job):
     s.append("color" if job["color"] else "monochrome")
     kind = PAPERKIND.get(job["paper"])
     s.append(f"paperkind={kind}" if kind else f'paper={job["paper"]}')
-    # 不传 portrait/landscape：那两个参数只旋转内容、不改纸张方向，会和 SumatraPDF
-    # 自带的自动旋转叠加成转两次（横向内容缩成 71% 塞在纵向纸里）。
-    # 交给自动旋转：宽于高的页面自动转 90° 适配纸张，满版。
+    # 不写 portrait/landscape：那样只旋转内容、不改纸张方向，会和自动旋转叠加成转两次
+    # （横向内容缩成 71% 塞在纵向纸里）。交给自动旋转：宽于高的页面自动转 90° 适配纸张。
     mode = job.get("scale", "fit")      # 老调用方不带 scale 时维持原行为
     s.append(SCALE.get(mode, "fit"))
     if mode != "fit":
@@ -981,7 +977,7 @@ def conv_worker():
 
 def select_pages(pdf, nums):
     """抽出 nums 指定的页（1 起），写成一份临时 PDF。多页拼版前用来真正剔除
-    不打的页（拼版后页码变了，不能再靠 SumatraPDF 的页码参数）。"""
+    不打的页（拼版后页数变了，页码参数对不上）。"""
     nums = sorted(set(nums))
     doc = fitz.open(pdf)
     try:
@@ -1149,8 +1145,8 @@ def prepare(job):
     job["range"] = "" if job["pages"] == off else pages_text(nums)   # 全选就不用写页码
     nup = job.get("nup", 1)
     if nup > 1:
-        # 多页拼版后页数变了，页码参数不能再交给 SumatraPDF；先把要打的页真正抽成
-        # 一份 PDF（有页码筛选时），再整份拼版，最后按 noscale 打。
+        # 多页拼版后页数变了，页码参数对不上；先把要打的页真正抽成一份 PDF
+        # （有页码筛选时），再整份拼版，最后按 noscale 打。
         if job["range"]:
             job["path"] = select_pages(job["path"], nums)
             job["range"] = ""
@@ -1199,11 +1195,6 @@ def prep_worker():
             job["end"] = time.time()
 
 
-# SumatraPDF 的退出码就是它自己的 PrintResult 枚举，比它打印的日志好看得多
-SUMATRA_ERR = {1: "打印失败", 2: "打不开这个文件", 3: "文档不允许打印",
-               4: "找不到打印机", 5: "打印机/驱动报错", 6: "没有打印权限"}
-
-
 def _first_line(raw, n=160):
     """子进程的输出可能是一大坨日志，只留第一行有用的。"""
     txt = (raw or b"").decode("utf-8", "ignore").strip()
@@ -1211,24 +1202,12 @@ def _first_line(raw, n=160):
     return line[:n]
 
 
-def send_sumatra(job):
-    """老办法：交给 SumatraPDF。现在只在 GDI 送印不可用/兜底时走。"""
-    args = [SUMATRA, "-print-to", job["printer"],
-            "-print-settings", job["settings"], "-silent", job["path"]]
-    r = subprocess.run(args, capture_output=True, timeout=600,
-                       creationflags=0x08000000)
-    if r.returncode == 0:
-        return True, ""
-    msg = SUMATRA_ERR.get(r.returncode) or _first_line(r.stderr or r.stdout)
-    return False, f"SumatraPDF：{msg}"
-
-
 def send_gdi(job):
     """自己走 GDI 送印。返回 (成功, 错误信息, 失败时能否安全换引擎重试)。
 
     gdi_print.py 放子进程里跑：万一某个驱动把进程搞崩，崩的只是这个子进程，
     网页服务还在；超时也和原来一样能掐掉。
-    退出码 2 = 一页都没送出去（可以换引擎再来）；3/5 = 别重试（会重复出纸或本来就打不了）
+    返回 (成功, 错误信息)：失败不换引擎重试——唯一那条退路（SumatraPDF）已经移除了。
     """
     args = [sys.executable, os.path.join(BASE, "gdi_print.py"), job["path"], job["printer"],
             "--copies", str(job["copies"]), "--paper", job["paper"],
@@ -1239,9 +1218,9 @@ def send_gdi(job):
     r = subprocess.run(args, capture_output=True, timeout=600,
                        creationflags=0x08000000)
     if r.returncode == 0:
-        return True, "", False
+        return True, ""
     msg = _first_line(r.stderr) or f"送印失败（退出码 {r.returncode}）"
-    return False, msg, r.returncode == 2
+    return False, msg
 
 
 def print_job(job):
@@ -1249,18 +1228,7 @@ def print_job(job):
     job["state"] = "打印中"
     job["start"] = time.time()
     try:
-        if ENGINE == "gdi":
-            ok, msg, retry_safe = send_gdi(job)
-            # 一页都没送出去就失败了，换 SumatraPDF 再试一次是安全的；
-            # 已经送出去过就别重试，否则重复出纸、重复计费
-            if not ok and retry_safe and CFG.get("engine_fallback", True):
-                ok, msg2 = send_sumatra(job)
-                if ok:
-                    print(f"[提示] {job['name']} GDI 送印失败（{msg}），已改用 SumatraPDF")
-                else:
-                    msg = f"{msg}；{msg2}"
-        else:
-            ok, msg = send_sumatra(job)
+        ok, msg = send_gdi(job)
         if ok:
             job["state"] = "完成"
             log_job(job)              # 只有真正送印成功才记账

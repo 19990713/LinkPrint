@@ -8,9 +8,9 @@
 - 图片（jpg/png/bmp/tif/webp/gif）由 PyMuPDF 直接转 PDF，多页 TIFF 保留多页
 - **送印自己走 Windows GDI**（`gdi_print.py`）：PyMuPDF 按驱动分辨率把每页渲染成位图，
   `StartDoc` → 逐页 `StretchDIBits` → `EndDoc`。纸张/双面/份数/颜色直接写在 DEVMODE 上，
-  不再依赖 SumatraPDF 的 `paper=`/`paperkind=` 去猜驱动里的纸名。
-  实测同一份 7 页讲义、同一个 D95 驱动：SumatraPDF 53.9s，GDI 2.3s（输出的打印数据大小一样）。
-  SumatraPDF 仍留在目录里，作为 `engine: "sumatra"` 或 GDI 失败时的兜底
+  按 DMPAPER 编号指定纸张，不用按驱动里的纸名去猜。
+  实测同一份 7 页讲义、同一个 D95 驱动：旧版走 SumatraPDF 要 53.9s，GDI 2.3s（打印数据大小一样）。
+  **SumatraPDF 已彻底移除**，送印只有 GDI 这一条通道
 - **合并打印**：把勾选的文件按参数（打印机/份数/色彩/纸张/双面/缩放）分组，组内用 PyMuPDF
   拼成一份 PDF，一次送印命令代替 N 次。参数相同的文件越多，省下的时间越多
 - 页面缩放四档：适合（`fit`，会缩也会放大）/ 实际大小（`noscale`）/ 缩小过大（`shrink`）/ 自定义比例。
@@ -21,8 +21,8 @@
   `-3--1`（最后三页），中英文逗号/顿号/空格都当分隔符。送印前解析成具体页号；
   合并打印时按各份实际页数自动换算偏移，页数和金额只算真正打出来的那些页
 - **多页（N-up）**：把多页缩印到一张纸上，和 Acrobat Reader 打印对话框的「每页张数」一样。
-  每行可选 1/2/4/6/9/16 页；2 页并排用横向纸，其余按 2×2、2×3、3×3、4×4 排。SumatraPDF
-  没有 N-up 参数，所以由 PyMuPDF 拼成每张纸一份页面的新 PDF（缓存名带 `_nup{N}`）再按
+  每行可选 1/2/4/6/9/16 页；2 页并排用横向纸，其余按 2×2、2×3、3×3、4×4 排。送印层只按
+  1 页 1 张纸处理，所以由 PyMuPDF 先拼成每张纸一份页面的新 PDF（缓存名带 `_nup{N}`）再按
   `noscale` 送印。金额按**纸张数**计（`ceil(页数/每页张数)`），预览同样按张翻页
 - **跨文件多页**：勾选多个文件 + 每行「每页张数」一致 + 点「合并打印」，就把不同文件的页
   也拼到同一张纸上（后端合并后再 N-up 拼版）。顶部「拼版预览」按钮可先预览这种拼到
@@ -31,7 +31,7 @@
   （`_转换缓存` 里 `名字_大小_时间.pdf` 及 `_s{pct}`、`_nup{N}` 变体）和打剩的合并临时文件。
   只认列表里的文件名，热文件夹里其它文件不碰；还在打印的任务会拦住不让清
 - 预览分两档：**打印效果**（按当前纸张/缩放/色彩把整张纸渲染成图，看缩放比、裁切、横竖方向）
-  和 **原文件**（PDF 直连，看内容细节）。前者模拟 SumatraPDF 的排版规则：自动旋转、fit 缩放、
+  和 **原文件**（PDF 直连，看内容细节）。前者和实际送印用同一套排法：自动旋转、fit 缩放、
   居中；自定义比例超过纸面时按纸裁切并给出提示
 
 ## 性能设计
@@ -59,9 +59,9 @@
 
 需要 Windows、Python 3.12+、`pip install pymupdf pywin32 numpy`。
 
-**SumatraPDF.exe 不在本仓库**（16MB 第三方程序）：只有在 `engine` 设成 `sumatra` 或 GDI 送印
-失败兜底时才用到。要用就从 https://www.sumatrapdfreader.org/download-free-pdf-viewer
-下载 portable 版，把 `SumatraPDF.exe` 放到本目录，与 `print_system.py` 同级。
+**不再需要 SumatraPDF**（2026-11-14 已从项目移除）。送印由 `gdi_print.py` 直接用 Windows GDI
+完成，没有外部可执行依赖；如果以后要回退到旧版本，从 git 历史里 checkout 那几个提交即可
+（`77b03c9` 之前的版本都依赖 SumatraPDF）。
 
 ```
 python print_system.py        # 或双击 启动打印系统.bat
@@ -82,10 +82,8 @@ python gdi_print.py a.pdf "🖤黑白机D95" --copies 2 --paper A4 --duplex long
 | `hotfolder` | 热文件夹，相对路径按本目录算 |
 | `printers` | 按**关键字**匹配本机打印机名（如 `D95`、`C7580`），改显卡/改机器只需改这里 |
 | `papers` | 界面可选的纸张，默认 `A4`/`A3` |
-| `engine` | 送印引擎：`gdi`（默认，快）/ `sumatra`（老办法，慢 20 倍，留着做对照） |
-| `engine_fallback` | `true` 时 GDI 在「一页都没送出去」的失败下自动换 SumatraPDF 再试一次，默认开 |
+| `engine` | 固定 `gdi`（只有这一种引擎；写别的值也会按 gdi 跑） |
 | `print_parallel` | `true`（默认）不同打印机并行送印；改 `false` 就是所有机器排一条队 |
-| `sumatra` | SumatraPDF 路径（兜底用） |
 | `convert2pdf` | `Convert2PDF.ps1` 的路径，找不到它就只支持 PDF 和图片 |
 | `preview_margin_mm` | 打印效果预览里每边扣掉的「不可打印区」毫米数，默认 4。真实边距由驱动决定、拿不到；4mm 大致对应 A4 满幅时 Acrobat 显示的 96% |
 

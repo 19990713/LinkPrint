@@ -35,7 +35,7 @@ except ImportError:                       # 老版本 PyMuPDF
 
 try:
     import numpy as np
-except ImportError:                       # 没有 numpy 就只能走 SumatraPDF 兜底
+except ImportError:                       # 缺 numpy 就没法送印，父进程会直接报错退出
     np = None
 
 BASE = os.path.dirname(os.path.abspath(__file__))
