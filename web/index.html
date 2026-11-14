@@ -78,6 +78,9 @@
   .st.doing{background:#e8f0ff;color:#2f5bea}
   .st.done{background:#e6f6ec;color:#17864a}
   .st.err{background:#fdeaea;color:#c62828}
+  .st .note{display:inline-block;width:13px;height:13px;line-height:13px;margin-left:4px;
+    border-radius:50%;background:#f0a020;color:#fff;font-size:10px;font-style:normal;
+    text-align:center;vertical-align:1px;cursor:help}
   .empty{padding:60px;text-align:center;color:var(--muted)}
   .footer{position:fixed;bottom:0;left:0;right:0;display:flex;align-items:center;gap:14px;
           padding:11px 18px;background:var(--card);border-top:1px solid var(--line);
@@ -492,7 +495,7 @@ function render(){
         <option value="6" ${s.nup===6?'selected':''}>6 页</option>
         <option value="9" ${s.nup===9?'selected':''}>9 页</option>
         <option value="16" ${s.nup===16?'selected':''}>16 页</option></select></td>
-      <td><span class="st ${cls}" ${job&&job.msg?`title="${esc(job.msg)}"`:''}>${esc(st)}</span></td>
+      <td><span class="st ${cls}" ${job&&job.msg?`title="${esc(job.msg)}"`:''}>${esc(st)}${job&&job.msg?'<i class="note" title="'+esc(job.msg)+'">!</i>':''}</span></td>
       <td><button class="mini" data-act="pv" ${f.error?'disabled':''}>预览</button>
           <button class="mini" data-act="one">打印</button></td>
     </tr>`;

@@ -74,6 +74,13 @@ COLORONCOLOR, HALFTONE = 3, 4
 MAX_PIXELS = 120_000_000
 MM_PER_INCH = 25.4
 
+# 每次 StretchDIBits 送多少行。整页一次性丢给驱动，遇到 A0/A1 或复杂 CAD 图时
+# 有些 PCL 驱动会吃不下（表现为图上整条整条空白），分带后每次只有千余行，稳得多。
+BAND_ROWS = 1024
+# 图纸比纸大多少算"放不下"。打印机边距造成的 3~5% 溢出属正常（100% 打 A4 文档时
+# 左右各裁掉 4.5mm），不触发自动缩小，否则「实际大小」档就名存实亡。
+OVER_TOL = 1.10
+
 
 class PrintError(Exception):
     """code 就是进程退出码，父进程靠它决定要不要换引擎重试：
@@ -313,29 +320,79 @@ def _dib(pix, rot):
     return np.ascontiguousarray(a), w, h
 
 
-def _blit(dib, hdc, dw, dh, x, y):
-    """把 (buffer, 宽, 高) 这一张位图贴到 x,y，目标大小 dw×dh（1:1 时就是原尺寸）。"""
+def _blit(dib, hdc, dx, dy, dw, dh, sx=0, sy=0, sw=None, sh=None):
+    """把位图的一块（源矩形 sx,sy,sw,sh）贴到 dx,dy 处，目标大小 dw×dh。
+
+    DIB 头里写的是整张图（bw×bh），源矩形另给 —— 这样分带送图不用复制内存。
+    """
     gdi32 = api()["gdi32"]
-    buf, w, h = dib
+    buf, bw, bh = dib
+    sw = bw if sw is None else sw
+    sh = bh if sh is None else sh
     bi = BITMAPINFO()
     bi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
-    bi.bmiHeader.biWidth = w
-    bi.bmiHeader.biHeight = -h              # 负数 = 自上而下，和位图内存顺序一致
+    bi.bmiHeader.biWidth = bw
+    bi.bmiHeader.biHeight = -bh             # 负数 = 自上而下，和位图内存顺序一致
     bi.bmiHeader.biPlanes = 1
     bi.bmiHeader.biBitCount = 24
     bi.bmiHeader.biCompression = 0          # BI_RGB
     bi.bmiHeader.biSizeImage = buf.nbytes
-    ret = gdi32.StretchDIBits(hdc, x, y, dw, dh, 0, 0, w, h,
+    ret = gdi32.StretchDIBits(hdc, dx, dy, dw, dh, sx, sy, sw, sh,
                               buf.ctypes.data_as(ctypes.c_void_p), ctypes.byref(bi),
                               0, SRCCOPY)
     if ret == 0:
         raise PrintError("位图送驱动被拒（StretchDIBits 返回 0）", code=3)
 
 
+def plan_bands(x, y, dw, dh, left, top, right, bottom, bw, bh, band_rows=None):
+    """算出分带方案：把位图（bw×bh）按 (x,y,dw,dh) 铺到纸上、只保留纸面内 (left,top,right,bottom)
+    的那部分，切成长度不超过 band_rows 的横带。
+
+    产出 (dx, dy, dw, dh, sx, sy, sw, sh)：目标矩形 + 源矩形，逐个交给 StretchDIBits。
+    纯计算，不碰 GDI —— 自检可以直接验它有没有留缝、有没有重复。
+    """
+    band_rows = band_rows or BAND_ROWS
+    out = []
+    sx0 = max(0, min(bw - 1, int(round((left - x) * bw / dw))))
+    sx1 = max(sx0 + 1, min(bw, int(round((right - x) * bw / dw))))
+    sy = max(0, min(bh - 1, int(round((top - y) * bh / dh))))
+    dy = top
+    while dy < bottom:
+        band = min(band_rows, bottom - dy)
+        sy_next = min(bh, max(sy + 1, int(round((dy + band - y) * bh / dh))))
+        out.append((left, dy, right - left, band, sx0, sy, sx1 - sx0, sy_next - sy))
+        sy = sy_next
+        dy += band
+        if sy >= bh:
+            break
+    return out
+
+
+def _blit_image(dib, hdc, x, y, dw, dh, paper_w, paper_h):
+    """把整张位图贴到纸面的 (x,y) 上，尺寸 dw×dh，只画纸面以内的部分，并按行分带送驱动。
+
+    两个作用：
+    * 超出纸面的部分由我们自己先裁掉，而不是把几万像素的大矩形丢给驱动去裁
+      （驱动裁切时静默丢数据是"内容不全"的已知来源）；
+    * 每带只有 BAND_ROWS 行，A0/A1 这类大图也不会一次压垮驱动。
+    返回 (可见宽, 可见高, 是否被裁)。
+    """
+    buf, w, h = dib
+    left, top = max(0, x), max(0, y)
+    right, bottom = min(paper_w, x + dw), min(paper_h, y + dh)
+    if right <= left or bottom <= top:
+        return 0, 0, True
+    clipped = x < 0 or y < 0 or x + dw > paper_w or y + dh > paper_h
+    for dx, dy, bw, bh, sx, sy, sw, sh in plan_bands(x, y, dw, dh, left, top, right, bottom, w, h):
+        _blit(dib, hdc, dx, dy, bw, bh, sx, sy, sw, sh)
+    return right - left, bottom - top, clipped
+
+
+
 # ---------------- 主流程 ----------------
 
 def print_pdf(path, printer, copies=1, paper="A4", duplex="single",
-              scale="fit", color=False, page_spec="", probe=False):
+              scale="fit", color=False, page_spec="", probe=False, oversize="shrink"):
     """把一个 PDF 送到打印机。probe=True 只读设备能力，不建打印作业。"""
     if not available():
         raise PrintError("当前环境不支持 GDI 送印（缺 numpy 或不是 Windows）", code=5)
@@ -357,7 +414,7 @@ def print_pdf(path, printer, copies=1, paper="A4", duplex="single",
             if not hdc:
                 raise PrintError(f"CreateDC 失败「{printer}」（错误码 {ctypes.get_last_error()}）")
             try:
-                return _run(doc, pages, hdc, printer, mode, color, path)
+                return _run(doc, pages, hdc, printer, mode, color, path, oversize)
             finally:
                 gdi32.DeleteDC(hdc)
         finally:
@@ -366,7 +423,7 @@ def print_pdf(path, printer, copies=1, paper="A4", duplex="single",
         doc.close()
 
 
-def _run(doc, pages, hdc, printer, mode, color, path):
+def _run(doc, pages, hdc, printer, mode, color, path, oversize="shrink"):
     gdi32 = api()["gdi32"]
     w = gdi32.GetDeviceCaps(hdc, HORZRES)          # 可打印区域（设备像素）
     h = gdi32.GetDeviceCaps(hdc, VERTRES)
@@ -382,6 +439,7 @@ def _run(doc, pages, hdc, printer, mode, color, path):
         raise PrintError(f"StartDoc 失败「{printer}」（错误码 {ctypes.get_last_error()}）")
 
     sent = 0
+    warns = []
     gdi32.SetMapMode(hdc, 1)                        # MM_TEXT：一个单位 = 一个设备像素
     # 单色机要让 GDI 自己去做抖动（否则灰阶层次全丢成纯黑纯白）；彩机逐色直传
     gdi32.SetStretchBltMode(hdc, COLORONCOLOR if color else HALFTONE)
@@ -402,6 +460,19 @@ def _run(doc, pages, hdc, printer, mode, color, path):
                 k = min(1.0, fit)                  # 只缩不放
             else:
                 k = 1.0                            # noscale / custom（比例已烘进 PDF）
+
+            # 纸放不下：1:1 打 1261mm 的图纸到 A3，硬打只能出左上角一张 —— 就是
+            # "内容不全"。除非明确要求 clip，否则自动缩到能放下，保证整张图出全。
+            k_orig = k
+            over = max(cw * dpi * k / w, ch * dpi * k / h)
+            shrunk = False
+            if over > OVER_TOL and oversize == "shrink":
+                k = fit if fit < k else k
+                shrunk = True
+                warns.append(f"图纸 {cw * 25.4:.0f}×{ch * 25.4:.0f}mm 装不进纸张 "
+                             f"{w / dpi * 25.4:.0f}×{h / dpi * 25.4:.0f}mm，已按 "
+                             f"{k * 100:.0f}% 缩放打全（所选比例 {k_orig * 100:.0f}%）")
+
             px_w, px_h = cw * dpi * k, ch * dpi * k
             rk = k
             if px_w * px_h > MAX_PIXELS:           # 太大会吃爆内存，降分辨率再拉伸
@@ -416,9 +487,13 @@ def _run(doc, pages, hdc, printer, mode, color, path):
             dib = _dib(pix, rot)
             pix = None
             dw, dh = max(1, int(round(px_w))), max(1, int(round(px_h)))
-            x, y = max(0, (w - dw) // 2), max(0, (h - dh) // 2)            # 居中
-            _blit(dib, hdc, dw, dh, x, y)
+            x, y = (w - dw) // 2, (h - dh) // 2            # 居中；超出部分由 _blit_image 裁掉
+            _, _, clipped = _blit_image(dib, hdc, x, y, dw, dh, w, h)
             dib = None
+            if clipped and not shrunk:
+                warns.append(f"图纸 {cw * 25.4:.0f}×{ch * 25.4:.0f}mm 大于纸张"
+                             f"{w / dpi * 25.4:.0f}×{h / dpi * 25.4:.0f}mm，"
+                             f"按实际大小只打出中间一块；改用「适合」可打全")
             if gdi32.EndPage(hdc) <= 0:
                 raise PrintError("EndPage 失败（打印机报错或脱机）", code=3)
             sent += 1
@@ -429,7 +504,10 @@ def _run(doc, pages, hdc, printer, mode, color, path):
     except Exception:
         gdi32.AbortDoc(hdc)
         raise
-    return {"pages": len(pages), "printed": sent}
+    out = {"pages": len(pages), "printed": sent}
+    if warns:
+        out["warn"] = "；".join(dict.fromkeys(warns))      # 去重，多页重复的不刷屏
+    return out
 
 
 # ---------------- 命令行 ----------------
@@ -447,6 +525,8 @@ def main(argv):
     ap.add_argument("--scale", default="fit", choices=list(SCALE_ID))
     ap.add_argument("--color", type=int, default=0)
     ap.add_argument("--range", dest="page_spec", default="")
+    ap.add_argument("--oversize", default="shrink", choices=["shrink", "clip"],
+                    help="图纸比纸大时的处理：shrink=自动缩到放得下（默认），clip=按原大小裁切")
     ap.add_argument("--probe", action="store_true", help="只读设备能力，不出纸")
     args = ap.parse_args(argv)
 
@@ -462,7 +542,7 @@ def main(argv):
             raise PrintError(f"文件不存在：{args.pdf}", code=5)
         r = print_pdf(args.pdf, args.printer, copies=args.copies, paper=args.paper,
                       duplex=args.duplex, scale=args.scale, color=bool(args.color),
-                      page_spec=args.page_spec)
+                      page_spec=args.page_spec, oversize=args.oversize)
         sys.stdout.write(json.dumps(r, ensure_ascii=False) + "\n")
         return 0
     except PrintError as e:
