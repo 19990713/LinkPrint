@@ -6,15 +6,19 @@
 - 预检（页数、实际尺寸、方向、混合尺寸提示）由 PyMuPDF 读 PDF 得出
 - Office 文件靠 `Convert2PDF.ps1`（WPS/Office COM）转 PDF，转换结果按 `名字_大小_时间.pdf` 缓存
 - 图片（jpg/png/bmp/tif/webp/gif）由 PyMuPDF 直接转 PDF，多页 TIFF 保留多页
-- 送印走 SumatraPDF 命令行；纸张用 `paperkind=`（DMPAPER 编号）避开驱动纸名匹配问题
+- **送印自己走 Windows GDI**（`gdi_print.py`）：PyMuPDF 按驱动分辨率把每页渲染成位图，
+  `StartDoc` → 逐页 `StretchDIBits` → `EndDoc`。纸张/双面/份数/颜色直接写在 DEVMODE 上，
+  不再依赖 SumatraPDF 的 `paper=`/`paperkind=` 去猜驱动里的纸名。
+  实测同一份 7 页讲义、同一个 D95 驱动：SumatraPDF 53.9s，GDI 2.3s（输出的打印数据大小一样）。
+  SumatraPDF 仍留在目录里，作为 `engine: "sumatra"` 或 GDI 失败时的兜底
 - **合并打印**：把勾选的文件按参数（打印机/份数/色彩/纸张/双面/缩放）分组，组内用 PyMuPDF
   拼成一份 PDF，一次送印命令代替 N 次。参数相同的文件越多，省下的时间越多
 - 页面缩放四档：适合（`fit`，会缩也会放大）/ 实际大小（`noscale`）/ 缩小过大（`shrink`）/ 自定义比例。
-  前三档是 SumatraPDF 原生参数；**自定义比例没有原生支持**，由 PyMuPDF 把每页重排成 X% 的新 PDF
-  （缓存名带 `_s{pct}`，注释和表单会被拍平成内容），送印时按 `noscale` 打
+  **自定义比例没有原生支持**，由 PyMuPDF 把每页重排成 X% 的新 PDF
+  （缓存名带 `_s{pct}`，注释和表单会被拍平成内容），送印时按 100% 打
 - 打印记录写入 `打印记录.csv`
 - **按页打印**：每行「页码范围」留空打全部，也可写 `1-3,5`、`5-`（到末尾）、`-1`（末页）、
-  `-3--1`（最后三页），中英文逗号/顿号/空格都当分隔符。用的是 SumatraPDF 原生页码参数；
+  `-3--1`（最后三页），中英文逗号/顿号/空格都当分隔符。送印前解析成具体页号；
   合并打印时按各份实际页数自动换算偏移，页数和金额只算真正打出来的那些页
 - **多页（N-up）**：把多页缩印到一张纸上，和 Acrobat Reader 打印对话框的「每页张数」一样。
   每行可选 1/2/4/6/9/16 页；2 页并排用横向纸，其余按 2×2、2×3、3×3、4×4 排。SumatraPDF
@@ -36,7 +40,11 @@
 
 - `POST /api/print` 只做校验（文件在不在热文件夹、参数合不合法）就返回，实测 2ms 上下
 - **准备线程**（`PREP_Q`）：转 Office/图片 → 按比例重排 → 多份合并 → 算页数和金额
-- **送印线程**（`READY_Q`）：按顺序调 SumatraPDF（它本身是单实例的，并发反而打乱顺序）
+- **分派线程**（`READY_Q`）→ **每台打印机一条送印队列**：同一台机器严格按顺序（多任务同时送
+  会乱页、抢带宽），但 D95 在打的时候彩机 C7580 不必跟着排队。实测两台机各打一份 2 页：
+  并行 11.3s、串行要 12.4s（受慢的 PS 驱动拖累的那台不再堵住快的 PCL 机）
+- 送印本身在子进程里跑（`gdi_print.py`），驱动把进程搞崩或卡死都只影响这一份活，网页服务不受影响，
+  超时 10 分钟掐掉
 - 两条流水线并行：打前一份的时候，后面几份已经在转/合并了，慢的部分被打印时间盖住
 - 任务状态：`排队中` → `准备中` → `打印中` → `完成`/`失败`，前端在有任务时 0.6s 轮询一次
 - 热文件夹刷新不再等 WPS：没转好的文件先显示「转换中…」，`conv_worker` 后台转完下一轮刷新
@@ -49,14 +57,17 @@
 
 ## 运行
 
-需要 Windows、Python 3.12+、`pip install pymupdf pywin32`。
+需要 Windows、Python 3.12+、`pip install pymupdf pywin32 numpy`。
 
-**SumatraPDF.exe 不在本仓库**（16MB 第三方程序）：从 https://www.sumatrapdfreader.org/download-free-pdf-viewer
+**SumatraPDF.exe 不在本仓库**（16MB 第三方程序）：只有在 `engine` 设成 `sumatra` 或 GDI 送印
+失败兜底时才用到。要用就从 https://www.sumatrapdfreader.org/download-free-pdf-viewer
 下载 portable 版，把 `SumatraPDF.exe` 放到本目录，与 `print_system.py` 同级。
 
 ```
 python print_system.py        # 或双击 启动打印系统.bat
 python 自检.py                 # 纸型识别 / 参数串 / 计费 / 真实 PDF 预检 自检
+python gdi_print.py --probe "🖤黑白机D95"    # 看某台打印机的可打印区域、分辨率（不出纸）
+python gdi_print.py a.pdf "🖤黑白机D95" --copies 2 --paper A4 --duplex long
 ```
 
 启动后自动打开 `http://127.0.0.1:8777`（端口被占会自动往后找）。
@@ -71,7 +82,10 @@ python 自检.py                 # 纸型识别 / 参数串 / 计费 / 真实 PD
 | `hotfolder` | 热文件夹，相对路径按本目录算 |
 | `printers` | 按**关键字**匹配本机打印机名（如 `D95`、`C7580`），改显卡/改机器只需改这里 |
 | `papers` | 界面可选的纸张，默认 `A4`/`A3` |
-| `sumatra` | SumatraPDF 路径 |
+| `engine` | 送印引擎：`gdi`（默认，快）/ `sumatra`（老办法，慢 20 倍，留着做对照） |
+| `engine_fallback` | `true` 时 GDI 在「一页都没送出去」的失败下自动换 SumatraPDF 再试一次，默认开 |
+| `print_parallel` | `true`（默认）不同打印机并行送印；改 `false` 就是所有机器排一条队 |
+| `sumatra` | SumatraPDF 路径（兜底用） |
 | `convert2pdf` | `Convert2PDF.ps1` 的路径，找不到它就只支持 PDF 和图片 |
 | `preview_margin_mm` | 打印效果预览里每边扣掉的「不可打印区」毫米数，默认 4。真实边距由驱动决定、拿不到；4mm 大致对应 A4 满幅时 Acrobat 显示的 96% |
 

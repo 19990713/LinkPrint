@@ -37,6 +37,12 @@ DEFAULT_CFG = {
     "printers": ["D95", "D125", "C7580"],
     "papers": ["A4", "A3"],
     "sumatra": "SumatraPDF.exe",
+    # 送印引擎：gdi = 自己走 GDI（快，实测 7 页从 54s 降到 2s 量级）；sumatra = 老办法
+    "engine": "gdi",
+    # gdi 引擎在「还没往打印机送任何数据」的失败下，自动换 sumatra 再试一次
+    "engine_fallback": True,
+    # 不同打印机之间并行送印（同一台机器仍然严格按顺序，不会乱）
+    "print_parallel": True,
     # Office -> PDF 转换器（WPS COM）。找不到它就只支持 PDF
     "convert2pdf": r"D:\脚本文件\多文件合并PDF\Convert2PDF.ps1",
     # 打印效果预览里，纸张四边扣掉多少毫米当"不可打印区"（估算）。
@@ -79,6 +85,19 @@ if not os.path.isfile(C2P) and os.path.isfile(os.path.join(BASE, "Convert2PDF.ps
     C2P = os.path.join(BASE, "Convert2PDF.ps1")
 POWERSHELL = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
 CONV_DIR = os.path.join(BASE, "_转换缓存")
+
+# 送印引擎。gdi_print.py 直接用 Windows GDI 把位图交给驱动：实测同一份 7 页讲义，
+# SumatraPDF 要 53.9s（其中它自己 CPU 只用了 1.7s，基本在干等），走 GDI 只要 2.3s。
+try:
+    import gdi_print
+except Exception as _e:                      # 缺 numpy 之类，退回 SumatraPDF
+    gdi_print = None
+    print("[提示] gdi_print 不可用，送印改用 SumatraPDF：", _e)
+
+ENGINE = str(CFG.get("engine", "gdi")).lower()
+if ENGINE == "gdi" and (gdi_print is None or not gdi_print.available()):
+    print("[提示] 当前环境不支持 GDI 送印，自动改用 SumatraPDF")
+    ENGINE = "sumatra"
 
 
 def resolve_printers(keywords):
@@ -762,8 +781,10 @@ def list_files():
 
 
 # ---------------- 打印队列 ----------------
-# 两道工序分开排队：PREP_Q（转 PDF / 缩放 / 合并）→ READY_Q（送印）。
+# 三道工序分开排队：PREP_Q（转 PDF / 缩放 / 合并）→ READY_Q（汇总）→ 各打印机自己的队列（送印）。
 # 分开的好处：下单请求立刻返回；打前一份的时候，后一份已经在准备了。
+# 送印这一层按打印机拆开：同一台机器必须串行（多任务同时送会乱页、还会抢带宽），
+# 但 D95 在打的时候彩机 C7580 没道理跟着排队 —— 不同机器之间并行。
 PREP_Q = queue.Queue()
 READY_Q = queue.Queue()
 JOBS = {}          # id -> job
@@ -773,10 +794,23 @@ MERGE_DIR = os.path.join(CONV_DIR, "_合并")
 # 还在跑的状态。清空队列遇到这几种要拦住，等打完再说
 ACTIVE_STATES = ("排队中", "准备中", "打印中")
 
+PARALLEL = bool(CFG.get("print_parallel", True))
+if PARALLEL:
+    PRINTER_Q = {p: queue.Queue() for p in PRINTERS}          # 一台机器一条队列
+elif PRINTERS:
+    # 串行模式（print_parallel=false）：所有机器共用一条队列，就是老行为
+    _common = queue.Queue()
+    PRINTER_Q = {p: _common for p in PRINTERS}
+else:
+    PRINTER_Q = {}
+# 没有匹配到打印机时也得有地方放活儿，别在分派线程里炸
+PRINT_QUEUES = list(dict.fromkeys(PRINTER_Q.values())) or [queue.Queue()]
+
 DUPLEX = {"single": "simplex", "long": "duplexlong", "short": "duplexshort"}
 # DMPAPER_* 编号。本机驱动的纸名叫 "A4(210x297mm)"，Sumatra 的 paper=A4 匹配不上
 # （它只认完整同名或 "A4 " 带空格前缀），会退回"按文档尺寸自定义纸张"，驱动找不到
 # 这种纸就落到 A3 —— 233x479mm 的图打成 A3 就是这么来的。paperkind 直接给编号。
+# 这张表只在 SumatraPDF 兜底时才用；gdi_print 里有一份同样的（自检会比对两份是否一致）。
 PAPERKIND = {"A4": 9, "A3": 8, "A5": 11, "B4": 12, "B5": 13, "Letter": 1, "Legal": 5, "11x17": 3}
 
 # ---------------- 页码范围 ----------------
@@ -1165,39 +1199,108 @@ def prep_worker():
             job["end"] = time.time()
 
 
-def print_worker():
-    """严格按顺序送印（SumatraPDF 是单实例的，并发反而会打乱顺序）。"""
+# SumatraPDF 的退出码就是它自己的 PrintResult 枚举，比它打印的日志好看得多
+SUMATRA_ERR = {1: "打印失败", 2: "打不开这个文件", 3: "文档不允许打印",
+               4: "找不到打印机", 5: "打印机/驱动报错", 6: "没有打印权限"}
+
+
+def _first_line(raw, n=160):
+    """子进程的输出可能是一大坨日志，只留第一行有用的。"""
+    txt = (raw or b"").decode("utf-8", "ignore").strip()
+    line = next((x for x in txt.splitlines() if x.strip()), "")
+    return line[:n]
+
+
+def send_sumatra(job):
+    """老办法：交给 SumatraPDF。现在只在 GDI 送印不可用/兜底时走。"""
+    args = [SUMATRA, "-print-to", job["printer"],
+            "-print-settings", job["settings"], "-silent", job["path"]]
+    r = subprocess.run(args, capture_output=True, timeout=600,
+                       creationflags=0x08000000)
+    if r.returncode == 0:
+        return True, ""
+    msg = SUMATRA_ERR.get(r.returncode) or _first_line(r.stderr or r.stdout)
+    return False, f"SumatraPDF：{msg}"
+
+
+def send_gdi(job):
+    """自己走 GDI 送印。返回 (成功, 错误信息, 失败时能否安全换引擎重试)。
+
+    gdi_print.py 放子进程里跑：万一某个驱动把进程搞崩，崩的只是这个子进程，
+    网页服务还在；超时也和原来一样能掐掉。
+    退出码 2 = 一页都没送出去（可以换引擎再来）；3/5 = 别重试（会重复出纸或本来就打不了）
+    """
+    args = [sys.executable, os.path.join(BASE, "gdi_print.py"), job["path"], job["printer"],
+            "--copies", str(job["copies"]), "--paper", job["paper"],
+            "--duplex", job["duplex"], "--scale", job.get("scale", "fit"),
+            "--color", "1" if job["color"] else "0"]
+    if job.get("range"):
+        args += ["--range", job["range"]]
+    r = subprocess.run(args, capture_output=True, timeout=600,
+                       creationflags=0x08000000)
+    if r.returncode == 0:
+        return True, "", False
+    msg = _first_line(r.stderr) or f"送印失败（退出码 {r.returncode}）"
+    return False, msg, r.returncode == 2
+
+
+def print_job(job):
+    """送一份进打印机：成功才记账，失败把原因写进 job 里给页面看。"""
+    job["state"] = "打印中"
+    job["start"] = time.time()
+    try:
+        if ENGINE == "gdi":
+            ok, msg, retry_safe = send_gdi(job)
+            # 一页都没送出去就失败了，换 SumatraPDF 再试一次是安全的；
+            # 已经送出去过就别重试，否则重复出纸、重复计费
+            if not ok and retry_safe and CFG.get("engine_fallback", True):
+                ok, msg2 = send_sumatra(job)
+                if ok:
+                    print(f"[提示] {job['name']} GDI 送印失败（{msg}），已改用 SumatraPDF")
+                else:
+                    msg = f"{msg}；{msg2}"
+        else:
+            ok, msg = send_sumatra(job)
+        if ok:
+            job["state"] = "完成"
+            log_job(job)              # 只有真正送印成功才记账
+        else:
+            job["state"] = "失败"
+            job["msg"] = msg
+    except subprocess.TimeoutExpired:
+        job["state"] = "失败"
+        job["msg"] = "超时（>10 分钟）"
+    except Exception as e:
+        job["state"] = "失败"
+        job["msg"] = str(e)
+    job["end"] = time.time()
+    if job.get("tmp"):            # 合并出来的临时 PDF 打完就没用了
+        try:
+            os.remove(job["path"])
+        except OSError:
+            pass
+
+
+def dispatch_worker():
+    """把备好的活按打印机分到各自的队列里。"""
     while True:
         job = READY_Q.get()
-        job["state"] = "打印中"
-        job["start"] = time.time()
-        args = [SUMATRA, "-print-to", job["printer"],
-                "-print-settings", job["settings"], "-silent", job["path"]]
-        try:
-            r = subprocess.run(args, capture_output=True, timeout=600,
-                               creationflags=0x08000000)
-            if r.returncode == 0:
-                job["state"] = "完成"
-                log_job(job)          # 只有真正送印成功才记账
-            else:
-                job["state"] = "失败"
-                job["msg"] = (r.stderr or r.stdout or b"")[:300].decode("utf-8", "ignore").strip()
-        except subprocess.TimeoutExpired:
-            job["state"] = "失败"
-            job["msg"] = "超时（>10 分钟）"
-        except Exception as e:
-            job["state"] = "失败"
-            job["msg"] = str(e)
-        job["end"] = time.time()
-        if job.get("tmp"):            # 合并出来的临时 PDF 打完就没用了
-            try:
-                os.remove(job["path"])
-            except OSError:
-                pass
+        PRINTER_Q.get(job["printer"], PRINT_QUEUES[0]).put(job)
 
 
-for _t in (conv_worker, prep_worker, print_worker):
+def print_worker(pq):
+    """一台打印机一条队列：同机严格按顺序，不同机互不排队。"""
+    while True:
+        print_job(pq.get())
+
+
+_threads = [conv_worker, prep_worker, dispatch_worker]
+for _q in PRINT_QUEUES:
+    _threads.append(lambda q=_q: print_worker(q))
+for _t in _threads:
     threading.Thread(target=_t, daemon=True).start()
+print(f"[送印] 引擎 {ENGINE}，{len(PRINT_QUEUES)} 条送印队列"
+      f"（{'按打印机并行' if PARALLEL else '全局串行'}）")
 
 
 def recent_jobs():

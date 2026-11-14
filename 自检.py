@@ -359,3 +359,39 @@ finally:
     if _nup and os.path.isfile(_nup):
         os.remove(_nup)
 
+
+
+# ---------------- GDI 送印引擎 ----------------
+assert ps.ENGINE in ("gdi", "sumatra"), ps.ENGINE
+# 纸型编号两张表必须一致（gdi_print 自己带一份，免得为了一个常量反向依赖）
+if ps.gdi_print:
+    assert ps.PAPERKIND == ps.gdi_print.PAPER_ID, (ps.PAPERKIND, ps.gdi_print.PAPER_ID)
+    assert ps.gdi_print.available(), "GDI 送印不可用（缺 numpy？）"
+    assert ps.gdi_print.parse_range("", 3) == [1, 2, 3]
+    assert ps.gdi_print.parse_range("1-3,5", 10) == [1, 2, 3, 5]
+    assert ps.gdi_print.parse_range("2-", 4) == [2, 3, 4]
+    assert ps.gdi_print.parse_range("99", 3) == []        # 全越界 -> 空，送印前就会拦住
+    print("GDI 引擎 OK  ", ps.ENGINE, "并行" if ps.PARALLEL else "串行",
+          f"{len(ps.PRINT_QUEUES)} 条队列")
+
+# 真实打印机的可打印区域（只读，不出纸）。离线/没装的跳过，不当失败
+if ps.gdi_print and ps.PRINTERS:
+    for _p in ps.PRINTERS:
+        try:
+            _c = ps.gdi_print.printer_caps(_p)
+            assert _c["w"] > 0 and _c["h"] > 0 and _c["dpi_x"] > 0, _c
+            assert _c["w"] < _c["phys_w"] and _c["h"] < _c["phys_h"], _c   # 可打印区必须小于纸
+            print(f"  {_p}  可打印 {_c['w']}×{_c['h']}px @{_c['dpi_x']}dpi  "
+                  f"纸 {_c['paper_mm'][0]}×{_c['paper_mm'][1]}mm")
+        except Exception as _e:
+            print(f"  [跳过] {_p}：{_e}")
+
+# 送印队列：任务只会进它那台打印机的队列
+if ps.PRINTER_Q:
+    _p0 = ps.PRINTERS[0]
+    assert ps.PRINTER_Q[_p0] in ps.PRINT_QUEUES
+    if ps.PARALLEL and len(ps.PRINTERS) > 1:
+        assert ps.PRINTER_Q[ps.PRINTERS[0]] is not ps.PRINTER_Q[ps.PRINTERS[1]], "并行模式队列不该共用"
+    else:
+        assert len(ps.PRINT_QUEUES) == 1, "串行模式应该只有一条队列"
+    print("送印队列 OK")
