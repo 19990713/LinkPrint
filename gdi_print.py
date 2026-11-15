@@ -315,14 +315,18 @@ def printer_caps(printer):
 # ---------------- 位图 ----------------
 
 def _dib(pix, rot):
-    """pymupdf 的 pixmap -> (buffer, 宽, 高)。顺便处理两件事：
-    1. 需要时顺时针转 90°（横向内容打到纵向纸上）；
-    2. DIB 每行必须 4 字节对齐，MuPDF 的 stride 是 width*n，不对齐直接喂 GDI
+    """pymupdf 的 pixmap -> (buffer, 宽, 高)。顺便处理三件事：
+    1. R/B 换序：MuPDF 的 samples 是 R,G,B，而 24bpp BI_RGB 的 DIB 内存顺序是
+       B,G,R。不换会把红章打成蓝章、蓝字打成红字（灰度/单通道不受影响）；
+    2. 需要时顺时针转 90°（横向内容打到纵向纸上）；
+    3. DIB 每行必须 4 字节对齐，MuPDF 的 stride 是 width*n，不对齐直接喂 GDI
        会静默返回 0（一张空白页，spool 只有两三 KB），很难查。
     """
     n = pix.n
     a = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.stride)
     a = a[:, :pix.width * n].reshape(pix.height, pix.width, n)
+    if n == 3:
+        a = np.ascontiguousarray(a[..., ::-1])
     if rot:
         a = np.rot90(a, k=-1)               # np.rot90 是逆时针，k=-1 才是顺时针
     h, w = a.shape[:2]
