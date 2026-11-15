@@ -319,45 +319,42 @@ finally:
 print("文件夹选择框 OK")
 
 # ---------------- 多页（N-up）拼版 ----------------
-_nup = ""
 try:
     # 网格映射：1/2/4/6/9/16 -> rows, cols
     assert ps.NUP_GRID == {1: (1, 1), 2: (1, 2), 4: (2, 2), 6: (2, 3), 9: (3, 3), 16: (4, 4)}
-    # nup=1 原样返回可打印 PDF，不拼版
-    assert ps.nup_pdf(files[0], 1, "A4") == ps.printable_pdf(files[0])
-    # 4 页文档 nup=4 -> 1 张；nup=2 -> 2 张，横向纸（841.9x595.3pt）
+    # 送印层（gdi_print）自带一份网格表，两份必须一致
+    if ps.gdi_print:
+        assert ps.NUP_GRID == ps.gdi_print.NUP_GRID, (ps.NUP_GRID, ps.gdi_print.NUP_GRID)
+    # 4 页文档：nup=4 第 1 张就装下全部 4 页，2x2 方正 → 竖纸 595x842pt
     src4 = files[1]                       # 【A4】...双科.pdf 是 4 页
     n4 = ps.preflight(src4)["pages"]
     assert n4 == 4, n4
-    p = ps.nup_pdf(src4, 4, "A4")
-    with fitz.open(p) as d:
-        assert d.page_count == 1, d.page_count
-    os.remove(p)
-    p = ps.nup_pdf(src4, 2, "A4")
-    with fitz.open(p) as d:
-        assert d.page_count == 2, d.page_count
-        assert abs(d[0].rect.width - 841.9) < 1 and abs(d[0].rect.height - 595.3) < 1, \
-            (d[0].rect.width, d[0].rect.height)
-    os.remove(p)
-    # 预览：nup=2 返回横向纸 meta（297x210mm）
+    with fitz.open(ps.printable_pdf(src4)) as _base:
+        _d, _pg = ps.nup_sheet(_base, 4, "A4", 1)
+        assert abs(_pg.rect.width - 595.3) < 1 and abs(_pg.rect.height - 841.9) < 1, \
+            (_pg.rect.width, _pg.rect.height)
+        _d.close()
+        # nup=2 是 1 行 2 列 → 横向纸 841.9x595.3pt；第 2 张纸是后两页
+        _d, _pg = ps.nup_sheet(_base, 2, "A4", 2)
+        assert abs(_pg.rect.width - 841.9) < 1 and abs(_pg.rect.height - 595.3) < 1, \
+            (_pg.rect.width, _pg.rect.height)
+        _d.close()
+    # 预览：nup=2 返回横向纸 meta（297x210mm），页数按张算
     png, meta = ps.preview_png(src4, "A4", "fit", 100, 1, False, 120, nup=2)
     assert meta["w"] == 297 and meta["h"] == 210 and meta["pages"] == 2, meta
-    # prepare：金额按纸张数计（4 页 nup=2 -> 2 张）
+    # prepare：不再另拼一份 PDF，直接拿原文件送印，金额按纸张数计（4 页 nup=2 -> 2 张）
     job = _prep(src4, copies=3, nup=2)
     ps.prepare(job)
-    assert job.get("sheets") == 2 and job["scale"] == "noscale", job
+    assert job.get("sheets") == 2, job
+    assert job["path"] == ps.preflight(src4)["pdf"], job["path"]   # 还是原文件，没拼版
     assert abs(job["amount"] - 0.5 * 3 * 2) < 1e-9, job["amount"]
-    assert "noscale" in job["settings"] and "2x" not in job["settings"], job["settings"]
-    os.remove(job["path"])
-    # 页码筛选 + nup：4 页只打前 2 页，nup=2 -> 1 张
+    # 页码筛选 + nup：4 页只打前 2 页 -> 1 张，页码范围原样交给送印层
     job = _prep(src4, nup=2, specs=["1-2"])
     ps.prepare(job)
-    assert job.get("sheets") == 1, job
-    os.remove(job["path"])
-    print(f"多页拼版 OK  每张 2/4 页，金额按纸张数计，预览出横向纸")
-finally:
-    if _nup and os.path.isfile(_nup):
-        os.remove(_nup)
+    assert job.get("sheets") == 1 and job.get("range") == "1,2", job
+    print("多页拼版 OK  每张 2/4 页，直画不落盘，金额按纸张数计，预览出横向纸")
+except AssertionError:
+    raise
 
 
 
@@ -395,3 +392,74 @@ if ps.PRINTER_Q:
     else:
         assert len(ps.PRINT_QUEUES) == 1, "串行模式应该只有一条队列"
     print("送印队列 OK")
+
+# ---------------- 打印进度 / 取消 ----------------
+# 进度行是送印子进程往 stdout 一行行报的，父进程逐行吞（gdi_print._emit 写、这里读）
+_j = {"done": 0, "total": 0}
+ps._absorb_line(_j, "JOB 42")                     # spooler 作业号，取消时要用
+assert _j["_spool"] == 42, _j
+ps._absorb_line(_j, "P 3 10")
+assert (_j["done"], _j["total"]) == (3, 10), _j
+ps._absorb_line(_j, '{"pages": 10, "sheets": 10}')  # 最后那行结果 JSON 不该影响进度
+assert (_j["done"], _j["total"]) == (3, 10), _j
+ps._absorb_line(_j, "P 坏行")                      # 畸形行不能把送印搞崩
+assert (_j["done"], _j["total"]) == (3, 10), _j
+assert ps.gdi_print._emit is not None
+
+# prepare 要把进度分母算好：进度条一出来就有总数，不用等第一张纸打完
+job = _prep(files[1], copies=2)
+ps.prepare(job)
+assert job["total"] == job["pages"] and job["done"] == 0, job
+# 多页拼版按纸张数算（4 页 nup=2 -> 2 张）
+job = _prep(files[1], nup=2)
+ps.prepare(job)
+assert job["total"] == 2 and job["pages"] == 4, job
+print("进度分母 OK  单份 4 页，nup=2 -> 2 张")
+
+# 取消：三种状态各走一条路，另外还得挡住重复取消和不存在 id
+def _fake_job(state, **kw):
+    """造一个只在内存里的任务，绝不入队（后台送印线程会真的去打的）。"""
+    _fake_job.n += 1
+    j = {"id": 900 + _fake_job.n, "state": state, "msg": "", "name": "x.pdf",
+         "names": ["x.pdf"], "printer": ps.PRINTERS[0] if ps.PRINTERS else "D95",
+         "copies": 1, "color": False, "paper": "A4", "duplex": "single",
+         "scale": "fit", "pct": 100, "nup": 1, "total": 4, "done": 0}
+    j.update(kw)
+    with ps.JOBS_LOCK:
+        ps.JOBS[j["id"]] = j
+    return j
+
+
+_fake_job.n = 0
+_q = _fake_job("排队中")
+r = ps.cancel_jobs([_q["id"]])
+assert r[0]["ok"] and _q["state"] == "已取消" and _q["cancel"] is True, (_q, r)
+assert _q["msg"] == "已取消" and _q["end"] > 0, _q
+
+_done = _fake_job("完成")
+r = ps.cancel_jobs([_done["id"]])
+assert r[0]["ok"] and _done["state"] == "完成", r      # 打完的不动
+assert not _done.get("cancel"), "已完成的任务不该被打上取消标记"
+
+# 正在打的：没有作业号/子进程时 _abort_spool 什么也不做（不会误删别人的作业）
+_live = _fake_job("打印中", done=2, total=10)
+r = ps.cancel_jobs([_live["id"]])
+assert r[0]["ok"] and _live["state"] == "已取消", (_live, r)
+assert "已送出" in _live["msg"], _live          # 已出过纸要说清楚，别让人以为白打了
+
+assert ps.cancel_jobs([123456])[0]["ok"] is False, "不存在的任务应该报错而不是炸掉"
+
+# 合并出来的临时 PDF：取消后必须删掉，否则一直躺在缓存目录里
+tmpf = os.path.join(tempfile.gettempdir(), "lp_tmp_cancel.pdf")
+with open(tmpf, "wb") as f:
+    f.write(b"x")
+_t = _fake_job("排队中", tmp=True, path=tmpf)
+ps.cancel_jobs([_t["id"]])
+assert not os.path.exists(tmpf), "取消后要删掉合并出来的临时 PDF"
+
+# 送网页的字段里不能带运行时句柄：Popen 对象根本没法 JSON 化，一带上整页轮询就 500
+_fake_job("打印中", _proc=object(), _spool=7)
+for _row in ps.recent_jobs():
+    assert not [k for k in _row if k.startswith("_")], _row
+    assert "path" not in _row and "srcs" not in _row, _row
+print("取消任务 OK  排队中/打印中/已完成 三种状态，临时 PDF 一并清理")

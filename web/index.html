@@ -90,6 +90,41 @@
 
   .money{font-size:12px;font-weight:600;color:#17864a;background:#e6f6ec;
          padding:3px 9px;border-radius:6px;white-space:nowrap}
+
+  /* 打印进度面板：发出打印后浮在右下角，一单一行 + 进度条 + 取消 */
+  .pgpanel{position:fixed;right:18px;bottom:74px;width:392px;max-width:calc(100vw - 36px);
+           background:var(--card);border:1px solid var(--line);border-radius:12px;
+           box-shadow:0 12px 34px rgba(20,30,60,.18);z-index:90;display:none;overflow:hidden}
+  .pgpanel.show{display:block}
+  .pghead{display:flex;align-items:center;gap:8px;padding:9px 12px;
+          border-bottom:1px solid var(--line)}
+  .pghead b{font-size:13px}
+  .pgtail{color:var(--muted);font-size:12px}
+  .pgx{border:0;background:transparent;color:var(--muted);font-size:16px;line-height:1;
+       padding:2px 4px;cursor:pointer;border-radius:5px}
+  .pgx:hover{background:#f2f4f8;color:var(--text)}
+  .pglist{max-height:44vh;overflow:auto;padding:2px 12px 8px}
+  .pgrow{padding:9px 0;border-bottom:1px solid #f2f4f8}
+  .pgrow:last-child{border-bottom:0;padding-bottom:4px}
+  .pgline{display:flex;align-items:center;gap:8px}
+  .pgn{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:500}
+  .pgp{font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums;min-width:38px;
+       text-align:right}
+  .pgbar{margin-top:6px;height:7px;border-radius:4px;background:#eef1f6;overflow:hidden}
+  .pgbar i{display:block;height:100%;width:0;border-radius:4px;background:var(--accent);
+           transition:width .35s ease}
+  /* 排队/准备阶段后端还报不出张数，一条来回滑的短块 = 在动，但说不准到哪了。
+     别做满宽条纹，那看着像「快好了」 */
+  .pgbar.wait i{width:32%!important;background:var(--accent);
+                animation:pgslide 1.3s ease-in-out infinite}
+  @keyframes pgslide{from{transform:translateX(-110%)}to{transform:translateX(320%)}}
+  .pgrow.done .pgbar i{background:#17864a}
+  .pgrow.err .pgbar i{background:#c62828}
+  .pgrow.gone .pgbar i{background:#a8b0bd}
+  .pgmsg{margin-top:4px;font-size:11px;color:var(--muted);overflow:hidden;
+         text-overflow:ellipsis;white-space:nowrap}
+  .pgrow.err .pgmsg{color:#c62828}
+
   .modal{position:fixed;inset:0;background:rgba(22,28,42,.42);display:none;padding:40px 20px;z-index:100}
   .modal.show{display:flex}
   .sheet{background:#fff;border-radius:12px;width:100%;max-width:960px;margin:auto;
@@ -258,6 +293,17 @@
   </div>
 </div>
 
+<div class="pgpanel" id="pgpanel">
+  <div class="pghead">
+    <b>打印进度</b>
+    <span class="pgtail" id="pgTail"></span>
+    <div class="grow"></div>
+    <button class="mini danger" id="pgCancelAll">全部取消</button>
+    <button class="pgx" id="pgHide" title="收起（不影响打印，下次发出打印会再弹出来）">×</button>
+  </div>
+  <div class="pglist" id="pgList"></div>
+</div>
+
 <div class="toast" id="toast"></div>
 
 <script>
@@ -379,7 +425,8 @@ function paintStatus(){
     const st = j ? j.state : '—';
     const el = tr.querySelector('.st');
     el.className = 'st ' + stCls(st);
-    el.textContent = st;
+    // 正在打的那一单顺手把张数写上，表格里也能看出进度
+    el.textContent = (j && st === '打印中' && j.total) ? `${st} ${j.done || 0}/${j.total}` : st;
     el.title = (j && j.msg) || '';
   });
 }
@@ -1056,14 +1103,152 @@ async function send(names, merge){
       const st = {id:q.id, name:q.name, names:q.names || [q.name], state:q.state || '排队中'};
       LASTJOB[q.name] = st;
       for (const n of st.names) LASTJOB[n] = st;
+      if (!TRACK[q.id]) TRACK[q.id] = {t0: Date.now(), tEnd: 0};
     }
     ACTIVE = Math.max(ACTIVE, (r.queued || []).length);
+    PG_HIDDEN = false;                 // 新下的单，进度面板重新弹出来
+    renderProgress();
     if (FILES.length) paintStatus();
     toast(merge ? `已合并为 ${r.queued.length} 个打印任务（共 ${names.length} 份文件）`
                 : `已发出 ${r.queued.length} 个打印任务`);
     poll();
   }catch(err){ toast('发出失败：' + err, true); }
 }
+
+// ---------------- 打印进度面板 ----------------
+// 发出打印后右下角浮一块进度：一单一行，正在打的那条按「已送张数/总张数」走；
+// 排队/准备阶段后端还报不出张数，走流动条纹表示「在动但说不准」。每行一个取消按钮。
+let TRACK = {};       // id -> {t0: 出现时刻, tEnd: 结束时刻}
+let PPCT = {};        // id -> 上次百分比（取消/失败时把条停在那儿，别跳回 0）
+let JOBSBY = {};      // id -> 后端最新那一单
+let PG_SIG = '';      // 面板内容指纹，没变就不重画，免得闪
+let PG_HIDDEN = false;
+
+const RUN_STATES = ['排队中', '准备中', '打印中'];
+const isRunning = st => RUN_STATES.indexOf(st) >= 0;
+
+// 整个任务的百分比：准备阶段占前 45%，送印阶段 45→99，完成才给 100。
+// 份数由驱动自己复制，进度只按送进去的张数算。
+function jobPct(j){
+  if (j.state === '完成') return 100;
+  const t = j.total || 0, d = j.done || 0;
+  if (j.state === '打印中')
+    return t > 0 ? Math.min(99, 45 + Math.round(Math.min(1, d / t) * 55)) : 50;
+  if (j.state === '准备中') return 22;
+  if (j.state === '排队中') return 8;
+  return 0;
+}
+
+function jobWord(j){
+  const t = j.total || 0, d = j.done || 0;
+  switch (j.state){
+    case '打印中': return t ? `打印中 ${d}/${t} 张` : '打印中…';
+    case '准备中': return '准备中（转换 / 合并 / 缩放）…';
+    case '排队中': return '排队等待打印机…';
+    case '完成':   return (t ? `已完成，共 ${t} 张` : '已完成') + '，已记账';
+    case '已取消': return '已取消';
+    default:       return '失败';
+  }
+}
+
+// 记下要跟踪的任务；已经结束的留 6 秒给人看清结果，然后从面板上撤掉
+function trackJobs(jobs){
+  const now = Date.now();
+  for (const j of jobs){
+    if (isRunning(j.state) && !TRACK[j.id]) TRACK[j.id] = {t0: now, tEnd: 0};
+  }
+  for (const key of Object.keys(TRACK)){
+    const j = JOBSBY_OR(jobs, +key);
+    if (!j) { delete TRACK[key]; continue; }
+    if (isRunning(j.state)){ TRACK[key].tEnd = 0; continue; }
+    if (!TRACK[key].tEnd) TRACK[key].tEnd = now;
+    if (now - TRACK[key].tEnd > 6000){ delete TRACK[key]; delete PPCT[key]; }
+  }
+}
+const JOBSBY_OR = (jobs, id) => jobs.find(j => j.id === id);
+
+function renderProgress(){
+  const panel = $('#pgpanel');
+  const ids = Object.keys(TRACK).map(Number).sort((a, b) => TRACK[a].t0 - TRACK[b].t0);
+  if (!ids.length){
+    panel.classList.remove('show');
+    PG_SIG = '';
+    $('#pgTail').textContent = '';
+    $('#pgList').innerHTML = '';
+    return;
+  }
+  let running = 0;
+  const html = ids.map(id => {
+    const j = JOBSBY[id];
+    if (!j) return '';
+    const st = j.state;
+    if (isRunning(st)) running++;
+    const cls = st === '完成' ? 'done' : st === '失败' ? 'err'
+              : st === '已取消' ? 'gone' : '';
+    // 取消/失败时不知道停在哪一张，沿用上一次的百分比，条子别突然缩回去
+    let p = jobPct(j);
+    if (st === '已取消' || st === '失败') p = Math.max(p, PPCT[id] || 0);
+    PPCT[id] = p;
+    const wait = st === '排队中' || st === '准备中' || (st === '打印中' && !(j.total > 0));
+    // 说不准进度的时候就不报百分比，免得「22%」被当成真数
+    return `<div class="pgrow ${cls}">
+      <div class="pgline">
+        <span class="pgn" title="${esc(j.name || '')}">${esc(j.name || '')}</span>
+        <span class="pgp">${wait ? '…' : p + '%'}</span>
+        ${isRunning(st) ? `<button class="mini danger" data-cancel="${id}">取消</button>` : ''}
+      </div>
+      <div class="pgbar ${wait ? 'wait' : ''}"><i style="width:${p}%"></i></div>
+      <div class="pgmsg" title="${esc(j.msg || '')}">${esc(jobWord(j))}${j.msg ? ' · ' + esc(j.msg) : ''}</div>
+    </div>`;
+  }).join('');
+  if (html !== PG_SIG){ PG_SIG = html; $('#pgList').innerHTML = html; }
+  $('#pgTail').textContent = running
+    ? `${running} 个进行中`
+    : `全部结束（${ids.length} 个）`;
+  $('#pgCancelAll').disabled = !running;
+  panel.classList.toggle('show', !PG_HIDDEN);
+}
+
+async function cancelJobs(ids){
+  if (!ids.length) return;
+  try{
+    const r = await fetch('/api/cancel', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ids})}).then(r=>r.json());
+    if (r.error){
+      // 404 + not found 只可能是后端还没重启（跑的是旧代码），别让人以为任务坏了
+      if (/not found/.test(r.error))
+        return toast('当前打印服务是旧版本、没有取消接口，请关掉那个黑窗口重新双击'
+                     + '「启动打印系统.bat」', true);
+      return toast('取消失败：' + r.error, true);
+    }
+    const ok = (r.jobs || []).filter(x => x.ok).length;
+    toast(ok ? `已取消 ${ok} 个打印任务` : '没有可取消的任务', !ok);
+    await poll();                      // 立刻刷一次，别等下一轮轮询
+  }catch(e){ toast('取消失败：' + e, true); }
+}
+
+$('#pgList').addEventListener('click', e=>{
+  const b = e.target.closest('button[data-cancel]');
+  if (!b) return;
+  b.disabled = true;
+  b.textContent = '取消中…';
+  cancelJobs([+b.dataset.cancel]);
+});
+
+$('#pgCancelAll').addEventListener('click', ()=>{
+  const ids = Object.keys(TRACK).map(Number)
+    .filter(id => JOBSBY[id] && isRunning(JOBSBY[id].state));
+  if (!ids.length) return toast('没有正在进行的任务');
+  if (!confirm(`取消这 ${ids.length} 个打印任务？\n\n` +
+               `正在打印的那份会立刻掐断，但已经出来的纸收不回来。`)) return;
+  cancelJobs(ids);
+});
+
+$('#pgHide').addEventListener('click', ()=>{
+  PG_HIDDEN = true;
+  $('#pgpanel').classList.remove('show');
+});
 
 function printAll(merge){
   const names = FILES.filter(f=>ROWS[f.name].sel).map(f=>f.name);
@@ -1127,7 +1312,11 @@ async function poll(){
       else map[j.name] = j;
     }
     LASTJOB = map;
-    ACTIVE = r.jobs.filter(j=>j.state==='排队中'||j.state==='准备中'||j.state==='打印中').length;
+    JOBSBY = {};
+    for (const j of r.jobs) JOBSBY[j.id] = j;
+    ACTIVE = r.jobs.filter(j => isRunning(j.state)).length;
+    trackJobs(r.jobs);
+    renderProgress();
     if (FILES.length) paintStatus();
     if (finished) loadLog();
   }catch(e){}

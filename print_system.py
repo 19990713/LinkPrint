@@ -379,106 +379,53 @@ def scaled_pdf(src, pct):
 
 # ---------------- 多页（N-up） ----------------
 # 把 N 页缩印到一张纸上，和 Acrobat Reader 打印对话框的「每页张数」一个意思。
-# 送印层只按 1 页 1 张纸处理，所以 N-up 和自定义比例一样：先用 PyMuPDF 拼成
-# 每张纸一份页面的新 PDF（缓存名带 _nup{N}），再按 noscale 送印。
+# 送印时由 gdi_print.py 直接在一张纸上排 nup 个格子，不再另拼一份拼版 PDF；
+# 这里只留下预览要用的单张拼版（不落盘，翻到哪张拼哪张）。
 NUP_GRID = {1: (1, 1), 2: (1, 2), 4: (2, 2), 6: (2, 3), 9: (3, 3), 16: (4, 4)}
 
 
-def nup_target(src, nup):
-    st = os.stat(src)
-    stem = os.path.splitext(os.path.basename(src))[0]
-    return os.path.join(CONV_DIR, f"{stem}_{st.st_size}_{int(st.st_mtime)}_nup{nup}.pdf")
+def nup_sheet(src_doc, nup, paper, sheet_no):
+    """把 src_doc 第 sheet_no 张纸（1 起）上的 nup 页拼到一张纸上，返回 (doc, page)。
 
-
-def nup_pdf(src, nup, paper):
-    """把 src 每 nup 页缩印到一张 paper 纸上，返回缓存 PDF 路径。
-
-    纸张方向跟着网格走：列比行多就用横向纸（宽高对调），否则纵向。
-    每页按原始宽高比缩放进格子、不旋转，整体居中；页数和金额都按纸张数算。
+    只处理这一张纸要用的那 nup 页，既不遍历全文也不落盘：预览翻页时每翻一张只拼
+    这一张，比原来「整份拼一遍、写进缓存、再读回来」快得多。
+    送印不走这里——gdi_print.py 直接在一张纸上画 nup 个格子。
     """
-    nup = int(nup)
-    rows, cols = NUP_GRID.get(nup, (1, 1))
-    if nup == 1:
-        return printable_pdf(src)
-    t = nup_target(src, nup)
-    if os.path.isfile(t) and os.path.getsize(t):
-        return t
-    with SCALE_LOCK:
-        if os.path.isfile(t) and os.path.getsize(t):
-            return t
-        doc = fitz.open(printable_pdf(src))
-        try:
-            if doc.needs_pass:
-                raise RuntimeError("PDF 有密码，无法多页拼版")
-            if doc.page_count > 2000:
-                raise RuntimeError(f"页数太多（{doc.page_count}）")
-            n = doc.page_count
-            try:
-                doc.bake(annots=True, widgets=True)
-            except Exception:
-                pass
-            wmm, hmm = paper_mm(paper)
-            if cols > rows:                       # 横向网格用横向纸
-                pw, ph = max(wmm, hmm), min(wmm, hmm)
+    rows, cols = NUP_GRID.get(int(nup), (1, 1))
+    wmm, hmm = paper_mm(paper)
+    if cols > rows:                       # 列比行多就用横纸，和送印时的纸向一致
+        pw, ph = max(wmm, hmm), min(wmm, hmm)
+    else:
+        pw, ph = min(wmm, hmm), max(wmm, hmm)
+    pw, ph = pw * 72 / 25.4, ph * 72 / 25.4
+    cell_w, cell_h = pw / cols, ph / rows
+    out = fitz.open()
+    try:
+        np_ = out.new_page(width=pw, height=ph)
+        start = (int(sheet_no) - 1) * int(nup)
+        for j in range(int(nup)):
+            pno = start + j
+            if pno >= src_doc.page_count:
+                break
+            pg = src_doc[pno]
+            # 每页独立缩放塞进格子（不旋转，保持原方向），格内居中
+            k = min(cell_w / pg.rect.width, cell_h / pg.rect.height)
+            tw, th = pg.rect.width * k, pg.rect.height * k
+            r_, c_ = divmod(j, cols)
+            x0 = c_ * cell_w + (cell_w - tw) / 2
+            y0 = r_ * cell_h + (cell_h - th) / 2
+            target = fitz.Rect(x0, y0, x0 + tw, y0 + th)
+            if pg.rotation:
+                # 带 /Rotate 的页面走位图：先按呈现方向渲染，自己转到位再贴
+                src_dpi = max(120, min(300, int(round(300 / max(k, 0.05)))))
+                np_.insert_image(target, pixmap=_rotate_pixmap(
+                    pg.get_pixmap(dpi=src_dpi), 0))
             else:
-                pw, ph = min(wmm, hmm), max(wmm, hmm)
-            pw, ph = pw * 72 / 25.4, ph * 72 / 25.4
-            cell_w, cell_h = pw / cols, ph / rows
-            out = fitz.open()
-            try:
-                for i in range(0, n, nup):
-                    np_ = out.new_page(width=pw, height=ph)
-                    for j in range(nup):
-                        pno = i + j
-                        if pno >= n:
-                            break
-                        pg = doc[pno]
-                        # 每页独立缩放，塞进格子（不旋转，保持原方向）
-                        k = min(cell_w / pg.rect.width, cell_h / pg.rect.height)
-                        tw, th = pg.rect.width * k, pg.rect.height * k
-                        r_, c_ = divmod(j, cols)
-                        x0 = c_ * cell_w + (cell_w - tw) / 2
-                        y0 = r_ * cell_h + (cell_h - th) / 2
-                        target = fitz.Rect(x0, y0, x0 + tw, y0 + th)
-                        if pg.rotation:
-                            src_dpi = max(120, min(300, int(round(300 / max(k, 0.05)))))
-                            np_.insert_image(target, pixmap=_rotate_pixmap(
-                                pg.get_pixmap(dpi=src_dpi), 0))
-                        else:
-                            np_.show_pdf_page(target, doc, pno)
-                data = out.tobytes(deflate=True, garbage=1)
-            finally:
-                out.close()
-        finally:
-            doc.close()
-        os.makedirs(CONV_DIR, exist_ok=True)
-        part = t + ".part"
-        with open(part, "wb") as f:
-            f.write(data)
-        try:
-            os.replace(part, t)
-        except OSError:
-            if not os.path.isfile(t):
-                raise
-        finally:
-            if os.path.exists(part):
-                try:
-                    os.remove(part)
-                except OSError:
-                    pass
-        want = (n + nup - 1) // nup
-        try:
-            with fitz.open(t) as chk:
-                bad = chk.page_count != want
-        except Exception:
-            bad = True
-        if bad:
-            try:
-                os.remove(t)
-            except OSError:
-                pass
-            raise RuntimeError("多页拼版校验不通过（张数不符）")
-    return t
+                np_.show_pdf_page(target, src_doc, pno)
+        return out, np_
+    except Exception:
+        out.close()
+        raise
 
 
 def prune_cache(days=7):
@@ -568,34 +515,40 @@ def _rotate_pixmap(pix, rot):
 def preview_png(src, paper, mode="fit", pct=100, page_no=1, gray=False, dpi=120, nup=1):
     """按打印参数渲染整张纸的预览图，返回 (png bytes, 元信息 dict)。
 
-    nup>1 时先多页拼版成每张纸一份页面，再照 noscale 渲染那张纸；page_no / meta 里的
-    页数都按「纸张数」算，和真正送印时打出来的张数一致。
+    nup>1 时把第 page_no 张纸上的 nup 页在内存里拼成一张纸再渲染（不写缓存文件，
+    翻到哪张拼哪张）；page_no / meta 里的页数都按「纸张数」算，和送印的张数一致。
     """
-    doc = fitz.open(nup_pdf(src, nup, paper) if nup > 1 else printable_pdf(src))
+    nup = max(1, int(nup or 1))
+    base = fitz.open(printable_pdf(src))
+    sheet = None
     try:
-        if doc.needs_pass:
+        if base.needs_pass:
             raise RuntimeError("PDF 有密码，无法预览")
-        n = doc.page_count
-        if not n:
+        if not base.page_count:
             raise RuntimeError("文档里没有页面")
-        pno = max(1, min(int(page_no), n))
-        pg = doc[pno - 1]
-        page_rot = pg.rotation          # 源页自带的 /Rotate，get_pixmap 会应用
-        # 多页拼版后的页面已经是纸张大小，按 noscale 100% 打（其余缩放档对它无意义）
-        m = "noscale" if nup > 1 else mode
         wmm, hmm = paper_mm(paper)
         if nup > 1:
             rows, cols = NUP_GRID.get(nup, (1, 1))
-            if cols > rows:                       # 拼版时横向网格用了横向纸
+            if cols > rows:                       # 横向网格用横向纸，和送印时一致
                 wmm, hmm = hmm, wmm
-        rot, k, rect, over = print_layout(pg.rect.width, pg.rect.height,
-                                          paper, m, pct)
+            n = (base.page_count + nup - 1) // nup
+            pno = max(1, min(int(page_no), n))
+            sheet, pg = nup_sheet(base, nup, paper, pno)
+            doc, src_no = sheet, 0                # 拼出来的那一张临时纸
+            page_rot = pg.rotation
+            rot, k, over = 0, 1.0, False
+        else:
+            n = base.page_count
+            pno = max(1, min(int(page_no), n))
+            doc, src_no = base, pno - 1
+            pg = base[src_no]
+            page_rot = pg.rotation                # 源页自带的 /Rotate，get_pixmap 会应用
+            rot, k, rect, over = print_layout(pg.rect.width, pg.rect.height,
+                                              paper, mode, pct)
         pw, ph = wmm * 72 / 25.4, hmm * 72 / 25.4
         if nup > 1:
-            # 拼版页本身就是这张纸，noscale 不转不缩，直接满幅居中（不扣边距，看整张纸）
-            rot, k = 0, 1.0
+            # 拼版页本身就是这张纸，不转不缩，直接满幅居中（不扣边距，看整张纸）
             rect = fitz.Rect(0, 0, pw, ph)
-            over = False
         out = fitz.open()
         try:
             # 自定义比例 >100% 时内容会超到纸外。show_pdf_page / insert_image
@@ -614,7 +567,7 @@ def preview_png(src, paper, mode="fit", pct=100, page_no=1, gray=False, dpi=120,
                 np_.insert_image(target, pixmap=_rotate_pixmap(pg.get_pixmap(dpi=src_dpi), rot))
             else:
                 # 普通页面走矢量：show_pdf_page 只搬内容流，不重采样
-                np_.show_pdf_page(target, doc, pno - 1, rotate=rot)
+                np_.show_pdf_page(target, doc, src_no, rotate=rot)
             paper_rect = fitz.Rect(-bx0, -by0, pw - bx0, ph - by0)
             pix = np_.get_pixmap(clip=paper_rect, dpi=max(60, min(int(dpi), 200)),
                                  colorspace=fitz.csGRAY if gray else fitz.csRGB,
@@ -623,7 +576,9 @@ def preview_png(src, paper, mode="fit", pct=100, page_no=1, gray=False, dpi=120,
         finally:
             out.close()
     finally:
-        doc.close()
+        if sheet is not None:
+            sheet.close()
+        base.close()
     meta = {"page": pno, "pages": n, "pct": int(round(k * 100)),
             "rot": rot, "w": wmm, "h": hmm, "over": bool(over)}
     return png, meta
@@ -975,28 +930,6 @@ def conv_worker():
             CACHE.pop(b, None)          # 状态变了，下一轮刷新重新解析
 
 
-def select_pages(pdf, nums):
-    """抽出 nums 指定的页（1 起），写成一份临时 PDF。多页拼版前用来真正剔除
-    不打的页（拼版后页数变了，页码参数对不上）。"""
-    nums = sorted(set(nums))
-    doc = fitz.open(pdf)
-    try:
-        out = fitz.open()
-        try:
-            for p in nums:
-                out.insert_pdf(doc, from_page=p - 1, to_page=p - 1)
-            os.makedirs(MERGE_DIR, exist_ok=True)
-            t = os.path.join(MERGE_DIR, os.urandom(4).hex() + ".pdf")
-            part = t + ".part"
-            out.save(part, deflate=True, garbage=1)
-            os.replace(part, t)
-        finally:
-            out.close()
-    finally:
-        doc.close()
-    return t
-
-
 def merge_pdfs(pdfs):
     """把多份 PDF 首尾相接写成一份，返回新文件路径。各页尺寸保持不变。"""
     out = fitz.open()
@@ -1143,21 +1076,19 @@ def prepare(job):
         off += n
     job["pages"] = len(nums)
     job["range"] = "" if job["pages"] == off else pages_text(nums)   # 全选就不用写页码
-    nup = job.get("nup", 1)
+    nup = int(job.get("nup", 1) or 1)
     if nup > 1:
-        # 多页拼版后页数变了，页码参数对不上；先把要打的页真正抽成一份 PDF
-        # （有页码筛选时），再整份拼版，最后按 noscale 打。
-        if job["range"]:
-            job["path"] = select_pages(job["path"], nums)
-            job["range"] = ""
-        nup_path = nup_pdf(job["path"], nup, job["paper"])
-        if nup_path != job["path"]:
-            job["path"] = nup_path
+        # 多页缩印直接交给送印层：gdi_print.py 一张纸 StartPage 一次、画 nup 个格子，
+        # 不再先把 N 页拼成一份新 PDF。省掉整份重写 + 一份可能比原文件还大的磁盘缓存
+        # （show_pdf_page 会把字体/图像再嵌一遍），页码筛选也不必抽成临时文件 ——
+        # --range 照旧有效：先按页号挑页，再按顺序排格子。
         job["sheets"] = (job["pages"] + nup - 1) // nup
-        job["scale"] = "noscale"          # 拼版后的页面已是纸张大小，送印不缩放
     job["settings"] = build_settings(job)
     amount_pages = job.get("sheets", job["pages"])
     job["amount"] = round(job["unit"] * job["copies"] * amount_pages, 2)
+    # 进度条的分母：这一单总共要往驱动送几张纸（份数由驱动自己复制，不计在内）
+    job["total"] = amount_pages
+    job["done"] = 0
     return job
 
 
@@ -1181,18 +1112,36 @@ def enqueue(items, merge=False):
     return ok
 
 
+def _mark_cancelled(job):
+    """流水线上发现的「已被取消」：记一笔，顺手清掉临时合并文件。"""
+    job["state"] = "已取消"
+    job["msg"] = job.get("msg") or "已取消"
+    job["end"] = time.time()
+    _cleanup_tmp(job)
+
+
 def prep_worker():
+    """备货线程。取消在这里有两道关卡：进来时一次（还没开始转就白转了），
+    转完再一次（转换途中被取消的，别把这份送进送印队列）。"""
     while True:
         job = PREP_Q.get()
+        if job.get("cancel"):
+            _mark_cancelled(job)
+            continue
         job["state"] = "准备中"
         try:
             prepare(job)
-            job["state"] = "排队中"
-            READY_Q.put(job)
         except Exception as e:
             job["state"] = "失败"
             job["msg"] = str(e)
             job["end"] = time.time()
+            _cleanup_tmp(job)
+            continue
+        if job.get("cancel"):
+            _mark_cancelled(job)
+            continue
+        job["state"] = "排队中"
+        READY_Q.put(job)
 
 
 def _first_line(raw, n=160):
@@ -1202,12 +1151,46 @@ def _first_line(raw, n=160):
     return line[:n]
 
 
-def send_gdi(job):
-    """自己走 GDI 送印。返回 (成功, 错误信息, 失败时能否安全换引擎重试)。
+WATCHDOG_SEC = 600       # 单份送印最多等 10 分钟（原来 subprocess.run 的 timeout）
 
-    gdi_print.py 放子进程里跑：万一某个驱动把进程搞崩，崩的只是这个子进程，
-    网页服务还在；超时也和原来一样能掐掉。
-    返回 (成功, 错误信息)：失败不换引擎重试——唯一那条退路（SumatraPDF）已经移除了。
+
+def _kill_child(job, proc):
+    """超时看门狗：只有驱动真的卡死才会走到这里。"""
+    job["_timeout"] = True
+    if proc.poll() is None:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+
+
+def _absorb_line(job, line):
+    """消化送印子进程的一行输出。认两种进度行，其余（结果 JSON）忽略。
+
+        P <已送张数> <总张数>    进度条就用这两个数
+        JOB <id>                 spooler 作业号，取消时靠它删作业
+    """
+    if line.startswith("P "):
+        try:
+            _, d, t = line.split()
+            job["total"], job["done"] = int(t), int(d)
+        except ValueError:
+            pass
+    elif line.startswith("JOB "):
+        try:
+            job["_spool"] = int(line[4:].strip())
+        except ValueError:
+            pass
+
+
+def send_gdi(job):
+    """自己走 GDI 送印。返回 (成功, 错误信息)。
+
+    送印放子进程里跑：万一某个驱动把进程搞崩，崩的只是这个子进程，网页服务还在。
+    子进程往 stdout 一行行报进度，这里边读边写进 job["done"]/job["total"]。
+
+    取消是另一条线：cancel_jobs() 置 job["cancel"]、删掉 spooler 作业、再杀子进程，
+    这里要等到输出流断了才发现，所以「被取消」和「真失败」得分开报。
     """
     args = [sys.executable, os.path.join(BASE, "gdi_print.py"), job["path"], job["printer"],
             "--copies", str(job["copies"]), "--paper", job["paper"],
@@ -1215,16 +1198,125 @@ def send_gdi(job):
             "--color", "1" if job["color"] else "0"]
     if job.get("range"):
         args += ["--range", job["range"]]
-    r = subprocess.run(args, capture_output=True, timeout=600,
-                       creationflags=0x08000000)
-    if r.returncode == 0:
+    nup = int(job.get("nup", 1) or 1)
+    if nup > 1:
+        args += ["--nup", str(nup)]       # 送印层自己排格子，不再另拼一份 PDF
+
+    proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            creationflags=0x08000000)
+    job["_proc"] = proc               # cancel_jobs 靠它掐进程
+    timer = threading.Timer(WATCHDOG_SEC, lambda: _kill_child(job, proc))
+    timer.daemon = True
+    timer.start()
+    try:
+        for raw in proc.stdout:       # 逐行读，进程结束流才断
+            line = (raw or b"").decode("utf-8", "ignore").strip()
+            if line:
+                _absorb_line(job, line)
+        code = proc.wait()
+        try:
+            err = proc.stderr.read()
+        except Exception:
+            err = b""
+    finally:
+        timer.cancel()
+        job["_proc"] = None
+
+    if job.get("_timeout"):
+        return False, "超时（>10 分钟）"
+    if job.get("cancel"):
+        return False, "已取消" + ("（已送出的纸张无法收回）" if job.get("done") else "")
+    if code == 0:
         return True, ""
-    msg = _first_line(r.stderr) or f"送印失败（退出码 {r.returncode}）"
+    msg = _first_line(err) or f"送印失败（退出码 {code}）"
     return False, msg
+
+
+def _abort_spool(job):
+    """掐掉正在打的那一单：先从 spooler 删作业，再杀送印子进程。
+
+    顺序很重要——先删作业，驱动后续的 EndPage/EndDoc 会失败，子进程自己就退出，
+    不会留在队列里接着出纸；删不掉（作业已经结束、权限不够）才硬杀进程兜底。
+    """
+    jid = job.get("_spool")
+    if jid:
+        try:
+            import win32print
+            h = win32print.OpenPrinter(job["printer"])
+            try:
+                for cmd in (getattr(win32print, "JOB_CONTROL_DELETE", 5),
+                            getattr(win32print, "JOB_CONTROL_CANCEL", 3)):
+                    try:
+                        win32print.SetJob(h, jid, 0, None, cmd)
+                        break
+                    except Exception:
+                        continue
+            finally:
+                win32print.ClosePrinter(h)
+        except Exception as e:
+            print("[提示] 删打印作业失败:", e)
+    p = job.get("_proc")
+    if p is not None and p.poll() is None:
+        try:
+            p.terminate()
+        except Exception:
+            pass
+
+
+def cancel_jobs(ids):
+    """取消打印任务。按状态分三种处理：
+
+    - 排队中 / 准备中：只打标记，流水线轮到它时直接跳过（还没往打印机送东西，
+      没必要为它去动 spooler）
+    - 打印中：真去掐 —— 删 spooler 作业 + 杀子进程。已经出来的纸收不回来，页面上会说明
+    - 已经完成/失败/取消：原样回报，重复点不会出错
+    """
+    targets = []
+    for i in ids:
+        try:
+            n = int(i)
+        except (TypeError, ValueError):
+            continue
+        with JOBS_LOCK:
+            targets.append((n, JOBS.get(n)))
+    out = []
+    for n, job in targets:
+        if not job:
+            out.append({"id": n, "ok": False, "msg": "任务不存在"})
+            continue
+        if job["state"] in ("完成", "失败", "已取消"):
+            out.append({"id": n, "ok": True, "state": job["state"], "msg": "已经结束了"})
+            continue
+        job["cancel"] = True          # 流水线各道工序看到它就不会再往下走
+        if job["state"] == "打印中":
+            _abort_spool(job)         # 这一单已经在出纸，得真动手
+            job["msg"] = "已取消" + ("（已送出的纸张无法收回）" if job.get("done") else "")
+        else:
+            job["msg"] = "已取消"
+            job["end"] = time.time()
+            _cleanup_tmp(job)
+        job["state"] = "已取消"
+        out.append({"id": n, "ok": True, "state": job["state"]})
+    return out
+
+
+def _cleanup_tmp(job):
+    """合并出来的临时 PDF 用完就删（任务失败/取消也要删，否则一直躺在缓存里）。"""
+    if job.get("tmp") and job.get("path"):
+        try:
+            os.remove(job["path"])
+        except OSError:
+            pass
 
 
 def print_job(job):
     """送一份进打印机：成功才记账，失败把原因写进 job 里给页面看。"""
+    if job.get("cancel"):             # 排队期间就被取消了，别再送去打
+        job["state"] = "已取消"
+        job["msg"] = "已取消"
+        job["end"] = time.time()
+        _cleanup_tmp(job)
+        return
     job["state"] = "打印中"
     job["start"] = time.time()
     try:
@@ -1232,27 +1324,30 @@ def print_job(job):
         if ok:
             job["state"] = "完成"
             log_job(job)              # 只有真正送印成功才记账
+        elif job.get("cancel"):
+            job["state"] = "已取消"   # 被取消不算失败，别让人以为是打坏了
+            job["msg"] = msg
         else:
             job["state"] = "失败"
             job["msg"] = msg
-    except subprocess.TimeoutExpired:
-        job["state"] = "失败"
-        job["msg"] = "超时（>10 分钟）"
     except Exception as e:
-        job["state"] = "失败"
-        job["msg"] = str(e)
+        if job.get("cancel"):
+            job["state"] = "已取消"
+            job["msg"] = "已取消"
+        else:
+            job["state"] = "失败"
+            job["msg"] = "超时（>10 分钟）" if isinstance(e, subprocess.TimeoutExpired) else str(e)
     job["end"] = time.time()
-    if job.get("tmp"):            # 合并出来的临时 PDF 打完就没用了
-        try:
-            os.remove(job["path"])
-        except OSError:
-            pass
+    _cleanup_tmp(job)
 
 
 def dispatch_worker():
     """把备好的活按打印机分到各自的队列里。"""
     while True:
         job = READY_Q.get()
+        if job.get("cancel"):
+            _mark_cancelled(job)
+            continue
         PRINTER_Q.get(job["printer"], PRINT_QUEUES[0]).put(job)
 
 
@@ -1274,7 +1369,10 @@ print(f"[送印] 引擎 {ENGINE}，{len(PRINT_QUEUES)} 条送印队列"
 def recent_jobs():
     with JOBS_LOCK:
         js = sorted(JOBS.values(), key=lambda j: -j["id"])[:80]
-        return [{k: v for k, v in j.items() if k not in ("path", "srcs")} for j in js]
+        # path/srcs 是内部路径，_ 开头的是运行时句柄（子进程对象根本没法 JSON 化），
+        # 都别往网页送
+        return [{k: v for k, v in j.items()
+                 if k not in ("path", "srcs") and not k.startswith("_")} for j in js]
 
 
 # ---------------- 清空队列 ----------------
@@ -1321,8 +1419,8 @@ def clear_files(names):
     cache = 0
     for p in paths:
         t = conv_target(p)
-        # 缓存名是 名字_大小_时间.pdf，自定义比例再带 _s{pct}、多页拼版带 _nup{N}。
-        # 只清这一份的，同名的别的文件不误伤
+        # 缓存名是 名字_大小_时间.pdf，自定义比例再带 _s{pct}；_nup{N} 是老版本
+        # 拼版留下的，现在不再生成，顺手清掉。只清这一份的，同名的别的文件不误伤
         for f in [t] + glob.glob(t[:-4] + "_s*.pdf") + glob.glob(t[:-4] + "_nup*.pdf"):
             if os.path.isfile(f):
                 try:
@@ -1466,6 +1564,8 @@ class Handler(BaseHTTPRequestHandler):
                                                           bool(data.get("merge")))})
             if p == "/api/clear":
                 return self._send(200, clear_files(data.get("names", [])))
+            if p == "/api/cancel":
+                return self._send(200, {"jobs": cancel_jobs(data.get("ids", []))})
             return self._send(404, {"error": "not found"})
         except Exception as e:
             return self._send(400, {"error": str(e)})

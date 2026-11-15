@@ -17,8 +17,11 @@ SumatraPDF 的 `-print-to` 要 53.9 秒，而这 54 秒里它自己的 CPU 只�
 
 用法（父进程 print_system.py 就是这么调的）：
     python gdi_print.py <pdf> <打印机名> [--copies N] [--paper A4] [--duplex single]
-                        [--scale fit] [--color 1] [--range 1-3,5]
+                        [--scale fit] [--color 1] [--range 1-3,5] [--nup 4]
     python gdi_print.py --probe <打印机名>      # 只读设备能力，不出纸
+
+--nup N（每张纸印 N 页）在送印层直接排版：一张纸上 StartPage 一次、画 N 个格子，
+不需要先把 N 页拼成一份新 PDF 再打。--range 也照旧有效——先按页号挑页，再按顺序排格子。
 
 退出码：0 成功；2 还没往打印机送任何数据就失败了（可以安全地换引擎重试）；
 3 打到一半失败（别重试，否则重复出纸）；4 参数错误。
@@ -48,6 +51,8 @@ PAPER_ID = {"A4": 9, "A3": 8, "A5": 11, "B4": 12, "B5": 13,
 DUPLEX_ID = {"single": 1, "long": 2, "short": 3}
 # custom（自定义比例）在 prepare 里已经把比例烘进 PDF 了，送印时按 100% 打
 SCALE_ID = {"fit": "fit", "shrink": "shrink", "noscale": "noscale", "custom": "noscale"}
+# 每张纸印几页时的格子排法 (行, 列)。和 print_system.NUP_GRID 必须一致（自检会比对）。
+NUP_GRID = {1: (1, 1), 2: (1, 2), 4: (2, 2), 6: (2, 3), 9: (3, 3), 16: (4, 4)}
 
 DM_ORIENTATION = 0x00000001
 DM_PAPERSIZE = 0x00000002
@@ -59,6 +64,7 @@ DM_IN_BUFFER = 0x00000008
 DM_OUT_BUFFER = 0x00000002
 
 DMORIENT_PORTRAIT = 1
+DMORIENT_LANDSCAPE = 2
 DMCOLOR_MONOCHROME = 1
 DMCOLOR_COLOR = 2
 DMCOLLATE_TRUE = 1
@@ -73,6 +79,20 @@ COLORONCOLOR, HALFTONE = 3, 4
 # 超过上限就按比例降分辨率渲染、再交给 StretchDIBits 拉伸回原尺寸，别把内存吃穿。
 MAX_PIXELS = 120_000_000
 MM_PER_INCH = 25.4
+
+
+def _emit(line):
+    """给父进程报进度。父进程按行读 stdout，用前缀区分：
+        P <已送张数> <总张数>   每结束一张纸报一次
+        JOB <id>                spooler 里的作业号（取消时要靠它删作业）
+    其余不带前缀的那一行是最终结果 JSON。
+    必须 flush：走管道时 stdout 是块缓冲，不 flush 父进程要等到进程结束才看得见。
+    """
+    try:
+        sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+    except Exception:
+        pass
 
 
 class PrintError(Exception):
@@ -227,8 +247,12 @@ def parse_range(spec, total):
 
 # ---------------- DEVMODE ----------------
 
-def _open_devmode(printer, paper, duplex, copies, color):
-    """打开打印机，取出默认 DEVMODE，把我们关心的字段改掉，再让驱动校验一遍。"""
+def _open_devmode(printer, paper, duplex, copies, color, landscape=False):
+    """打开打印机，取出默认 DEVMODE，把我们关心的字段改掉，再让驱动校验一遍。
+
+    landscape 只给多页缩印用：格子列比行多（如 6 页 2x3）时把纸横过来，
+    内容才不用转 90°。单页打印一律纵向，横向内容由自动旋转处理。
+    """
     a = api()
     hpr = wintypes.HANDLE()
     if not a["spool"].OpenPrinterW(printer, ctypes.byref(hpr), None):
@@ -246,7 +270,7 @@ def _open_devmode(printer, paper, duplex, copies, color):
         d = dev.contents
         d.dmFields |= (DM_ORIENTATION | DM_PAPERSIZE | DM_COPIES | DM_COLOR
                        | DM_DUPLEX | DM_COLLATE)
-        d.dmOrientation = DMORIENT_PORTRAIT     # 纸张一律纵向，内容横着由自动旋转处理
+        d.dmOrientation = DMORIENT_LANDSCAPE if landscape else DMORIENT_PORTRAIT
         d.dmPaperSize = PAPER_ID.get(paper, 9)
         d.dmCopies = max(1, min(int(copies), 999))
         d.dmCollate = DMCOLLATE_TRUE if d.dmCopies > 1 else 0
@@ -335,12 +359,18 @@ def _blit(dib, hdc, dw, dh, x, y):
 # ---------------- 主流程 ----------------
 
 def print_pdf(path, printer, copies=1, paper="A4", duplex="single",
-              scale="fit", color=False, page_spec="", probe=False):
-    """把一个 PDF 送到打印机。probe=True 只读设备能力，不建打印作业。"""
+              scale="fit", color=False, page_spec="", probe=False, nup=1):
+    """把一个 PDF 送到打印机。probe=True 只读设备能力，不建打印作业。
+
+    nup>1 时每张纸印 nup 页：在送印层按格子排版，不需要先拼一份 PDF 出来。
+    """
     if not available():
         raise PrintError("当前环境不支持 GDI 送印（缺 numpy 或不是 Windows）", code=5)
     a = api()
     mode = SCALE_ID.get(scale, "fit")
+    nup = 1 if nup in (None, "") else int(nup)
+    if nup not in NUP_GRID:
+        raise PrintError(f"每页张数只能是 {'/'.join(map(str, NUP_GRID))}", code=5)
 
     if probe:
         return printer_caps(printer)
@@ -350,14 +380,16 @@ def print_pdf(path, printer, copies=1, paper="A4", duplex="single",
         pages = parse_range(page_spec, doc.page_count)
         if not pages:
             raise PrintError(f"{os.path.basename(path)}：没有要打的页（页码超出范围或全被排除）", code=5)
-        hpr, buf, dev = _open_devmode(printer, paper, duplex, copies, color)
+        rows, cols = NUP_GRID[nup]
+        hpr, buf, dev = _open_devmode(printer, paper, duplex, copies, color,
+                                      landscape=nup > 1 and cols > rows)
         try:
             gdi32 = a["gdi32"]
             hdc = gdi32.CreateDCW("WINSPOOL", printer, None, dev)
             if not hdc:
                 raise PrintError(f"CreateDC 失败「{printer}」（错误码 {ctypes.get_last_error()}）")
             try:
-                return _run(doc, pages, hdc, printer, mode, color, path)
+                return _run(doc, pages, hdc, printer, mode, color, path, nup)
             finally:
                 gdi32.DeleteDC(hdc)
         finally:
@@ -366,7 +398,7 @@ def print_pdf(path, printer, copies=1, paper="A4", duplex="single",
         doc.close()
 
 
-def _run(doc, pages, hdc, printer, mode, color, path):
+def _run(doc, pages, hdc, printer, mode, color, path, nup=1):
     gdi32 = api()["gdi32"]
     w = gdi32.GetDeviceCaps(hdc, HORZRES)          # 可打印区域（设备像素）
     h = gdi32.GetDeviceCaps(hdc, VERTRES)
@@ -377,9 +409,19 @@ def _run(doc, pages, hdc, printer, mode, color, path):
         raise PrintError(f"打印机「{printer}」没给出可打印区域")
     paper_landscape = phys_w > phys_h
 
+    # 多页缩印：把可打印区域切成 rows×cols 个格子。nup=1 时整张纸就是一格。
+    rows, cols = NUP_GRID.get(nup, (1, 1))
+    cell_w, cell_h = w / cols, h / rows
+
     di = DOCINFOW(ctypes.sizeof(DOCINFOW), os.path.basename(path), None, None, 0)
-    if gdi32.StartDocW(hdc, ctypes.byref(di)) <= 0:
+    # StartDoc 的返回值就是 spooler 里的作业号：父进程取消打印时用它 SetJob 删作业，
+    # 不然只能杀进程，作业会留在队列里接着出纸
+    jid = gdi32.StartDocW(hdc, ctypes.byref(di))
+    if jid <= 0:
         raise PrintError(f"StartDoc 失败「{printer}」（错误码 {ctypes.get_last_error()}）")
+    total_sheets = (len(pages) + nup - 1) // nup
+    _emit(f"JOB {jid}")
+    _emit(f"P 0 {total_sheets}")
 
     sent = 0
     gdi32.SetMapMode(hdc, 1)                        # MM_TEXT：一个单位 = 一个设备像素
@@ -388,40 +430,54 @@ def _run(doc, pages, hdc, printer, mode, color, path):
     if not color:
         gdi32.SetBrushOrgEx(hdc, 0, 0, None)
     try:
-        for no in pages:
-            page = doc[no - 1]
-            pw, ph = page.rect.width / 72.0, page.rect.height / 72.0      # 英寸
-            if pw <= 0 or ph <= 0:
-                continue
-            rot = 90 if (pw > ph) != paper_landscape else 0
-            cw, ch = (ph, pw) if rot else (pw, ph)                        # 旋转后的英寸尺寸
-            fit = min(w / (cw * dpi), h / (ch * dpi))
-            if mode == "fit":
-                k = fit
-            elif mode == "shrink":
-                k = min(1.0, fit)                  # 只缩不放
-            else:
-                k = 1.0                            # noscale / custom（比例已烘进 PDF）
-            px_w, px_h = cw * dpi * k, ch * dpi * k
-            rk = k
-            if px_w * px_h > MAX_PIXELS:           # 太大会吃爆内存，降分辨率再拉伸
-                rk = k * (MAX_PIXELS / (px_w * px_h)) ** 0.5
-            scale = dpi * rk / 72.0
-            if scale <= 0:
-                continue
+        for i in range(0, len(pages), nup):
             if gdi32.StartPage(hdc) <= 0:
                 raise PrintError("StartPage 失败（打印队列可能被暂停）", code=3)
-            pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale),
-                                  colorspace=fitz.csRGB, alpha=False)
-            dib = _dib(pix, rot)
-            pix = None
-            dw, dh = max(1, int(round(px_w))), max(1, int(round(px_h)))
-            x, y = max(0, (w - dw) // 2), max(0, (h - dh) // 2)            # 居中
-            _blit(dib, hdc, dw, dh, x, y)
-            dib = None
+            for j, no in enumerate(pages[i:i + nup]):
+                page = doc[no - 1]
+                pw, ph = page.rect.width / 72.0, page.rect.height / 72.0      # 英寸
+                if pw <= 0 or ph <= 0:
+                    continue
+                if nup > 1:
+                    # 拼版格子：不旋转（纸已按网格转过来了），每页独立等比缩进自己那格。
+                    # 缩放档对格子没有意义——塞不进格子就白打，所以一律按 fit。
+                    rot, cw, ch = 0, pw, ph
+                    k = min(cell_w / (cw * dpi), cell_h / (ch * dpi))
+                    r_, c_ = divmod(j, cols)
+                else:
+                    rot = 90 if (pw > ph) != paper_landscape else 0
+                    cw, ch = (ph, pw) if rot else (pw, ph)                    # 旋转后的英寸尺寸
+                    fit = min(w / (cw * dpi), h / (ch * dpi))
+                    if mode == "fit":
+                        k = fit
+                    elif mode == "shrink":
+                        k = min(1.0, fit)                  # 只缩不放
+                    else:
+                        k = 1.0                            # noscale / custom（比例已烘进 PDF）
+                    r_, c_ = 0, 0
+                px_w, px_h = cw * dpi * k, ch * dpi * k
+                rk = k
+                if px_w * px_h > MAX_PIXELS:           # 太大会吃爆内存，降分辨率再拉伸
+                    rk = k * (MAX_PIXELS / (px_w * px_h)) ** 0.5
+                scale = dpi * rk / 72.0
+                if scale <= 0:
+                    continue
+                pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale),
+                                      colorspace=fitz.csRGB, alpha=False)
+                dib = _dib(pix, rot)
+                pix = None
+                dw, dh = max(1, int(round(px_w))), max(1, int(round(px_h)))
+                if nup > 1:                            # 摆进自己那一格，格内居中
+                    x = max(0, int(round(c_ * cell_w + (cell_w - dw) / 2)))
+                    y = max(0, int(round(r_ * cell_h + (cell_h - dh) / 2)))
+                else:
+                    x, y = max(0, (w - dw) // 2), max(0, (h - dh) // 2)        # 居中
+                _blit(dib, hdc, dw, dh, x, y)
+                dib = None
             if gdi32.EndPage(hdc) <= 0:
-                raise PrintError("EndPage 失败（打印机报错或脱机）", code=3)
+                raise PrintError("EndPage 失败（打印机报错、脱机或被取消）", code=3)
             sent += 1
+            _emit(f"P {sent} {total_sheets}")       # 这一张已经交给驱动了
         if sent == 0:
             raise PrintError("没有可打印的页面", code=3)
         if gdi32.EndDoc(hdc) <= 0:
@@ -429,7 +485,7 @@ def _run(doc, pages, hdc, printer, mode, color, path):
     except Exception:
         gdi32.AbortDoc(hdc)
         raise
-    return {"pages": len(pages), "printed": sent}
+    return {"pages": len(pages), "sheets": sent, "printed": sent}
 
 
 # ---------------- 命令行 ----------------
@@ -447,6 +503,8 @@ def main(argv):
     ap.add_argument("--scale", default="fit", choices=list(SCALE_ID))
     ap.add_argument("--color", type=int, default=0)
     ap.add_argument("--range", dest="page_spec", default="")
+    ap.add_argument("--nup", type=int, default=1, choices=sorted(NUP_GRID),
+                    help="每张纸印几页（默认 1）")
     ap.add_argument("--probe", action="store_true", help="只读设备能力，不出纸")
     args = ap.parse_args(argv)
 
@@ -462,7 +520,7 @@ def main(argv):
             raise PrintError(f"文件不存在：{args.pdf}", code=5)
         r = print_pdf(args.pdf, args.printer, copies=args.copies, paper=args.paper,
                       duplex=args.duplex, scale=args.scale, color=bool(args.color),
-                      page_spec=args.page_spec)
+                      page_spec=args.page_spec, nup=args.nup)
         sys.stdout.write(json.dumps(r, ensure_ascii=False) + "\n")
         return 0
     except PrintError as e:
