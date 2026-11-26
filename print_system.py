@@ -40,6 +40,10 @@ DEFAULT_CFG = {
     "engine": "gdi",
     # 不同打印机之间并行送印（同一台机器仍然严格按顺序，不会乱）
     "print_parallel": True,
+    # 装订：「基础机关键字 -> 装订队列关键字」。装订是驱动私有设置，GDI 层改不了，
+    # 所以给装了装订器的机器另建一条同驱动的队列（驱动默认设置里 staple=ON），
+    # 送印时按需改走那条队列。例：{"D95": "D95 单钉"}。没配就没有「装订」这个选项。
+    "staple": {},
     # Office -> PDF 转换器（WPS COM）。找不到它就只支持 PDF
     "convert2pdf": r"D:\脚本文件\多文件合并PDF\Convert2PDF.ps1",
     # 打印效果预览里，纸张四边扣掉多少毫米当"不可打印区"（估算）。
@@ -97,17 +101,32 @@ if not gdi_print.available():
                      "修复：pip install numpy pymupdf pywin32")
 
 
-def resolve_printers(keywords):
-    """把关键字解析成本机真实打印机名（含 emoji 前缀）。"""
+def enum_printers():
+    """本机所有打印队列名（含 emoji 前缀）。枚举不到就返回空表，别让服务起不来。"""
     try:
         import win32print
-        names = [p["pPrinterName"] for p in win32print.EnumPrinters(6, None, 4)]
+        return [p["pPrinterName"] for p in win32print.EnumPrinters(6, None, 4)]
     except Exception as e:
         print("[警告] 无法枚举打印机:", e)
         return []
+
+
+def pick_printer(kw, names):
+    """关键字 -> 本机真实打印机名。命中多条时取名字最短的那条。
+
+    同一台机器为了「单钉」常常另建一条队列（名字只多了两个字），取最长的会把
+    装订队列当成正主，于是所有活都默认带上了订 —— 所以按长度取最短。
+    """
+    hits = [n for n in names if str(kw).lower() in n.lower()]
+    return min(hits, key=len) if hits else None
+
+
+def resolve_printers(keywords, names=None):
+    """把关键字解析成本机真实打印机名（含 emoji 前缀）。"""
+    names = enum_printers() if names is None else names
     out = []
     for kw in keywords:
-        hit = next((n for n in names if kw.lower() in n.lower()), None)
+        hit = pick_printer(kw, names)
         if hit and hit not in out:
             out.append(hit)
         elif not hit:
@@ -115,7 +134,25 @@ def resolve_printers(keywords):
     return out
 
 
-PRINTERS = resolve_printers(CFG["printers"])
+NAMES = enum_printers()
+PRINTERS = resolve_printers(CFG["printers"], NAMES)
+
+# 装订队列映射：{基础队列真名: 装订队列真名}。配错/没建就忽略，前端不会出这个选项。
+STAPLE = {}
+for _b, _s in (CFG.get("staple") or {}).items():
+    _rb, _rs = pick_printer(_b, NAMES), pick_printer(_s, NAMES)
+    if _rb and _rs and _rb != _rs and _rb in PRINTERS:
+        STAPLE[_rb] = _rs
+    elif _b:
+        print(f"[提示] 装订队列没配上（{_b} -> {_s}），这台机器不出「装订」选项")
+
+
+def spool_queue(job):
+    """这份活真正往哪条 Windows 队列送。选了装订就走装订队列 —— 那条队列的驱动
+    默认设置里 staple=ON，其余参数（纸张/双面/份数/色彩）照旧由 gdi_print 覆盖。"""
+    if job.get("staple"):
+        return STAPLE.get(job["printer"], job["printer"])
+    return job["printer"]
 
 
 def classify(w, h):
@@ -459,11 +496,14 @@ def paper_mm(paper):
     return STD_SIZES.get(paper) or STD_SIZES["A4"]
 
 
-def print_layout(page_w, page_h, paper, mode="fit", pct=100, margin_mm=None):
+def print_layout(page_w, page_h, paper, mode="fit", pct=100, margin_mm=None,
+                 paper_landscape=None):
     """预览用的排版规则（与 gdi_print 送印时的排法一致），返回
     (旋转角, 缩放比, 目标矩形, 是否超出纸面)。
 
     坐标用 pt、原点在纸张左上角。
+    - 纸向：默认按纸名本身（纵向）。paper_landscape=True 时把纸横过来；
+      预览里页面本身横向就传 True，这样看到的就是横着的一张纸，内容不用转 90°
     - 自动旋转：页面与纸张的横竖方向不一致就转 90°
     - fit：缩放到「纸张减去不可打印边距」，可缩也可放大
     - shrink：同上但只缩不放，小页面维持 100%
@@ -476,6 +516,8 @@ def print_layout(page_w, page_h, paper, mode="fit", pct=100, margin_mm=None):
         except (TypeError, ValueError):
             margin_mm = 4.0
     wmm, hmm = paper_mm(paper)
+    if paper_landscape:
+        wmm, hmm = max(wmm, hmm), min(wmm, hmm)
     pw, ph = wmm * 72 / 25.4, hmm * 72 / 25.4
     m = max(0.0, margin_mm) * 72 / 25.4
     area_w, area_h = max(pw - 2 * m, 1.0), max(ph - 2 * m, 1.0)
@@ -543,8 +585,15 @@ def preview_png(src, paper, mode="fit", pct=100, page_no=1, gray=False, dpi=120,
             doc, src_no = base, pno - 1
             pg = base[src_no]
             page_rot = pg.rotation                # 源页自带的 /Rotate，get_pixmap 会应用
+            # 页面本身是横向的，预览的纸也横过来 —— 实物就是这么一张横过来的纸
+            # （横纸纵向送、内容转 90°，纸上留下的内容和横着看是一回事，见 gdi_print
+            # 的 rot 分支），预览里则不必把内容转过去，看着才和手里的纸一致。
+            land = pg.rect.width > pg.rect.height
+            if land:
+                wmm, hmm = max(wmm, hmm), min(wmm, hmm)
             rot, k, rect, over = print_layout(pg.rect.width, pg.rect.height,
-                                              paper, mode, pct)
+                                              paper, mode, pct,
+                                              paper_landscape=land)
         pw, ph = wmm * 72 / 25.4, hmm * 72 / 25.4
         if nup > 1:
             # 拼版页本身就是这张纸，不转不缩，直接满幅居中（不扣边距，看整张纸）
@@ -849,6 +898,8 @@ def build_settings(job):
         s.append("collate")
     s.append(DUPLEX[job["duplex"]])
     s.append("color" if job["color"] else "monochrome")
+    if job.get("staple"):
+        s.append("staple")           # 装订：驱动那边走的是另一条队列，这里标出来给人看
     kind = PAPERKIND.get(job["paper"])
     s.append(f"paperkind={kind}" if kind else f'paper={job["paper"]}')
     # 不写 portrait/landscape：那样只旋转内容、不改纸张方向，会和自动旋转叠加成转两次
@@ -863,7 +914,41 @@ def build_settings(job):
 # ---------------- 计费 ----------------
 LOG_PATH = os.path.join(BASE, "打印记录.csv")
 A4_PRICE = {False: 0.5, True: 2.0}   # A4 每页：黑白 / 彩色；（True 在 dict 里等于 1）
-LOG_COLS = ["时间", "文件", "页数", "份数", "纸张", "色彩", "打印机", "单价元/页", "金额元"]
+# 「批次」= 一次下单（一次命令，可能含多个文件）。页面上按批次汇总一行，展开才看明细
+LOG_COLS = ["时间", "批次", "文件", "页数", "份数", "纸张", "色彩", "打印机",
+            "单价元/页", "金额元"]
+_BATCH_SEQ = [0]
+
+
+def new_batch():
+    """给一次下单发个批次号：同一秒连发两次也能分开。"""
+    _BATCH_SEQ[0] += 1
+    return time.strftime("%Y%m%d%H%M%S") + "-" + str(_BATCH_SEQ[0])
+
+
+def _migrate_log():
+    """老版 打印记录.csv 没有「批次」列。补一列空值（老记录各自算一单），
+    否则新记录按 10 列追加进去，DictReader 会拿 9 列表头去切，整份记录错位。"""
+    if not os.path.exists(LOG_PATH):
+        return
+    with open(LOG_PATH, encoding="utf-8-sig", newline="") as f:
+        rd = csv.reader(f)
+        try:
+            head = next(rd)
+        except StopIteration:
+            return
+        body = [r for r in rd if r]
+    if "批次" in head:
+        return
+    at = head.index("文件") if "文件" in head else min(1, len(head))
+    head.insert(at, "批次")
+    body = [r[:at] + [""] + r[at:] for r in body]
+    tmp = LOG_PATH + ".tmp"
+    with open(tmp, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        w.writerow(head)
+        w.writerows(body)
+    os.replace(tmp, LOG_PATH)
 
 
 def unit_price(paper, color):
@@ -873,24 +958,64 @@ def unit_price(paper, color):
 
 def log_job(job, ts=None):
     new = not os.path.exists(LOG_PATH)
+    if not new:
+        _migrate_log()                 # 老文件先补齐「批次」列，新行才对得上表头
     with open(LOG_PATH, "a", newline="", encoding="utf-8-sig" if new else "utf-8") as f:
         w = csv.writer(f)
         if new:
             w.writerow(LOG_COLS)
         w.writerow([time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts or time.time())),
+                    job.get("batch") or new_batch(),      # 没带批次的（老调用方）各自算一单
                     job["name"], job["pages"], job["copies"], job["paper"],
-                    "彩色" if job["color"] else "黑白", job["printer"],
+                    "彩色" if job["color"] else "黑白",
+                    job["printer"] + ("（单钉）" if job.get("staple") else ""),
                     f'{job["unit"]:.2f}', f'{job["amount"]:.2f}'])
+
+
+def _row_sheets(r):
+    """这一行实际出了几张纸（含份数）。金额 ÷ 单价最准——多页拼版时
+    金额按纸算而不是按文档页算，页数×份数会偏大。"""
+    try:
+        unit = float(r.get("单价元/页") or 0)
+        if unit > 0:
+            return int(round(float(r.get("金额元") or 0) / unit))
+    except (TypeError, ValueError):
+        pass
+    try:
+        return int(float(r.get("页数") or 0)) * int(float(r.get("份数") or 1))
+    except (TypeError, ValueError):
+        return 0
 
 
 def read_log():
     # shortcut: 每次全量读 CSV，几千条无压力；上万条再换 sqlite
     if not os.path.exists(LOG_PATH):
-        return {"rows": [], "today": 0, "total": 0, "count": 0}
-    with open(LOG_PATH, encoding="utf-8-sig") as f:
+        return {"rows": [], "batches": [], "today": 0, "total": 0, "count": 0}
+    _migrate_log()
+    with open(LOG_PATH, encoding="utf-8-sig", newline="") as f:
         rows = list(csv.DictReader(f))
+    # 按批次归堆：一次命令打出来的几行合起来才算「一单」
+    groups, order = {}, []
+    for i, r in enumerate(rows):
+        b = (r.get("批次") or "").strip() or f"单条-{i}"   # 老记录没有批次，各自成单
+        r["批次"] = b
+        if b not in groups:
+            groups[b] = []
+            order.append(b)
+        groups[b].append(r)
+    batches = []
+    for b in order:
+        g = groups[b]
+        batches.append({"批次": b,
+                        "时间": g[0].get("时间", ""),   # 同一单的文件陆续打完，取第一行
+                        "文件数": len(g),
+                        "页数": sum(int(float(x.get("页数") or 0)) for x in g),
+                        "张数": sum(_row_sheets(x) for x in g),
+                        "金额": round(sum(float(x.get("金额元") or 0) for x in g), 2),
+                        "明细": g})
+    batches.reverse()                  # 新的在上面
     today = time.strftime("%Y-%m-%d")
-    return {"rows": rows[-300:][::-1], "count": len(rows),
+    return {"rows": rows[-300:][::-1], "batches": batches[:300], "count": len(batches),
             "today": round(sum(float(r["金额元"]) for r in rows
                                if r["时间"].startswith(today)), 2),
             "total": round(sum(float(r["金额元"]) for r in rows), 2)}
@@ -954,14 +1079,15 @@ def merge_pdfs(pdfs):
 
 
 # 只有这几项完全相同才能拼成一份打：拼起来就是一次送印，参数只能有一套
-MERGE_KEY = ("printer", "copies", "color", "paper", "duplex", "scale", "pct", "nup")
+# （staple 也算：钉和不钉是两种产物，拼在一起就成了抢参数）
+MERGE_KEY = ("printer", "copies", "color", "paper", "duplex", "scale", "pct", "nup", "staple")
 
 
 def group_jobs(preps):
     """按送印参数分组。参数不同的各成一组，组内可以拼成一份一次送印。"""
     groups = {}
     for p in preps:
-        groups.setdefault(tuple(p[k] for k in MERGE_KEY), []).append(p)
+        groups.setdefault(tuple(p.get(k) for k in MERGE_KEY), []).append(p)
     return list(groups.values())
 
 
@@ -1002,6 +1128,9 @@ def _validate(it):
     duplex = it.get("duplex", "single")
     if duplex not in DUPLEX:
         raise ValueError("双面参数非法")
+    staple = bool(it.get("staple"))
+    if staple and printer not in STAPLE:
+        raise ValueError(f"{printer} 没有装订队列，不能选装订")
     color = bool(it.get("color"))
     scale = it.get("scale", "fit")
     if scale not in SCALE:
@@ -1035,6 +1164,7 @@ def _validate(it):
     return {"name": os.path.basename(path), "names": [os.path.basename(path)],
             "srcs": [path], "printer": printer, "copies": copies, "color": color,
             "paper": paper, "duplex": duplex, "scale": scale, "pct": pct, "nup": nup,
+            "staple": staple,
             "specs": [spec], "range": pages_text(pick) if pick else "",
             "pages": pages, "unit": unit,
             "amount": round(unit * copies * sheets, 2)}
@@ -1100,9 +1230,10 @@ def enqueue(items, merge=False):
     preps = [_validate(it) for it in items]
     jobs = [_merge_group(g) for g in group_jobs(preps)] if merge else preps
     ok = []
+    batch = new_batch()          # 这一次下单的所有文件算一单（页面上汇总成一行）
     for p in jobs:
         _seq[0] += 1
-        job = {"id": _seq[0], "state": "排队中", "msg": "", **p}
+        job = {"id": _seq[0], "state": "排队中", "msg": "", **p, "batch": batch}
         job["settings"] = build_settings(job)
         with JOBS_LOCK:
             JOBS[job["id"]] = job
@@ -1192,7 +1323,8 @@ def send_gdi(job):
     取消是另一条线：cancel_jobs() 置 job["cancel"]、删掉 spooler 作业、再杀子进程，
     这里要等到输出流断了才发现，所以「被取消」和「真失败」得分开报。
     """
-    args = [sys.executable, os.path.join(BASE, "gdi_print.py"), job["path"], job["printer"],
+    # 选了装订就换成装订队列（同驱动同端口，只是驱动默认设置里 staple=ON）
+    args = [sys.executable, os.path.join(BASE, "gdi_print.py"), job["path"], spool_queue(job),
             "--copies", str(job["copies"]), "--paper", job["paper"],
             "--duplex", job["duplex"], "--scale", job.get("scale", "fit"),
             "--color", "1" if job["color"] else "0"]
@@ -1242,7 +1374,7 @@ def _abort_spool(job):
     if jid:
         try:
             import win32print
-            h = win32print.OpenPrinter(job["printer"])
+            h = win32print.OpenPrinter(spool_queue(job))
             try:
                 for cmd in (getattr(win32print, "JOB_CONTROL_DELETE", 5),
                             getattr(win32print, "JOB_CONTROL_CANCEL", 3)):
@@ -1476,6 +1608,8 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/api/files":
             return self._send(200, {"folder": HOT, "printers": PRINTERS,
                                     "papers": CFG["papers"],
+                                    # 哪几台机器能装订（这些才出「装订」下拉框）
+                                    "staple_printers": list(STAPLE),
                                     "prices": {f"{pp}|{c}": unit_price(pp, c)
                                                for pp in CFG["papers"] for c in (0, 1)},
                                     "files": list_files()})
@@ -1595,6 +1729,8 @@ def main():
     print(" LinkPrint 就绪   http://127.0.0.1:%d" % port)
     print(" 热文件夹  ", HOT)
     print(" 打印机    ", " | ".join(PRINTERS) or "（无）")
+    if STAPLE:
+        print(" 装订队列  ", " | ".join(f"{b} -> {s}" for b, s in STAPLE.items()))
     print(" 关闭此窗口即停止服务")
     print("=" * 56)
     if "--no-browser" not in sys.argv:

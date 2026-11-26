@@ -141,6 +141,17 @@
   .modal .mbody td:first-child{border-left:0;border-radius:0}
   .modal .mbody td:last-child{border-right:0;border-radius:0}
   .modal .mbody tr:hover td{background:#fafbfd}
+  /* 打印记录：一行 = 一次下单（可含多个文件），点开才看明细 */
+  .log-sum{cursor:pointer}
+  .log-sum .caret{display:inline-block;width:13px;color:#98a0b0;transition:transform .12s}
+  .log-sum.open .caret{transform:rotate(90deg)}
+  .log-sum.open td{background:#f5f7fb}
+  .log-sum .cnt{color:#6d7686}
+  .log-det td{padding:6px 0 12px 0 !important;background:#f5f7fb}
+  .modal .mbody .log-det table{width:calc(100% - 22px);margin:0 0 0 22px;background:#fff;
+                               border:1px solid var(--line);border-radius:8px;overflow:hidden}
+  .modal .mbody .log-det th{position:static;background:#fbfcfe}
+  .log-det td,.log-det th{white-space:nowrap}
   .pv-sheet{max-width:1100px;height:100%}
   .pv-body{flex:1;min-height:0;display:flex}
   .pv-sheet iframe{flex:1;width:100%;min-height:0;border:0;background:#f0f2f6;display:none}
@@ -190,6 +201,11 @@
     <option value="long">双面·长边翻页</option>
     <option value="short">双面·短边翻页</option>
   </select>
+  <label>装订</label>
+  <select id="dStaple" title="打完在左上角钉一个钉（只有装了装订器的机器才有这一项）">
+    <option value="0">不钉</option>
+    <option value="1">单钉</option>
+  </select>
   <label>缩放</label>
   <select id="dScale">
     <option value="fit">适合</option>
@@ -220,14 +236,14 @@
       <col style="width:36px"><col id="colFile">
       <col style="width:62px"><col style="width:86px"><col id="colSize" style="width:78px"><col style="width:66px">
       <col id="colPrinter"><col style="width:86px"><col style="width:84px">
-      <col style="width:84px"><col style="width:116px"><col style="width:88px"><col style="width:100px"><col style="width:84px"><col><!-- 最后一列吃掉剩余宽度 -->
+      <col style="width:84px"><col style="width:116px"><col style="width:88px"><col style="width:100px"><col style="width:86px"><col style="width:84px"><col><!-- 最后一列吃掉剩余宽度 -->
     </colgroup>
     <thead><tr>
       <th><input type="checkbox" id="chkAll" checked onchange="toggleAll(this.checked)"></th>
       <th class="c-file" title="拖动右边界可调宽">文件</th><th>页数</th>
       <th title="留空打全部；可写 1-3,5 / 5- / -2（倒数第 2 页）">页码范围</th>
       <th>尺寸</th><th>方向</th>
-      <th>打印机</th><th>份数</th><th>色彩</th><th>纸张</th><th>双面方式</th><th>缩放</th><th>每页张数</th><th>状态</th><th></th>
+      <th>打印机</th><th>份数</th><th>色彩</th><th>纸张</th><th>双面方式</th><th>缩放</th><th>每页张数</th><th>装订</th><th>状态</th><th></th>
     </tr></thead>
     <tbody id="tbody"></tbody>
   </table>
@@ -307,13 +323,13 @@
 <div class="toast" id="toast"></div>
 
 <script>
-let CFG = {folder:'', printers:[], papers:[]};
+let CFG = {folder:'', printers:[], papers:[], staple_printers:[]};
 let FILES = [];
-let ROWS = {};       // name -> {sel, printer, copies, color, paper, duplex, scale, pct}
+let ROWS = {};       // name -> {sel, printer, copies, color, paper, duplex, scale, pct, nup, staple}
 let LASTJOB = {};    // name -> job
 let PREV = {};       // job id -> 上次看到的状态
 let SIG = '';
-let DEF = {printer:'', copies:1, color:0, paper:'A4', duplex:'single', scale:'fit', pct:100, nup:1};
+let DEF = {printer:'', copies:1, color:0, paper:'A4', duplex:'single', scale:'fit', pct:100, nup:1, staple:0};
 let lastSel = -1;    // Shift 连选的锚点：上次点击（或区间起点）在 FILES 里的索引
 let shiftClick = false;   // 本次勾选点击是否按住 Shift（mousedown 里记）
 
@@ -347,6 +363,25 @@ function setColorOptions(sel, isColor, val){
   sel.value = isColor && val ? '1' : '0';
 }
 
+// 这台机器能不能钉：后端按 config.json 的 staple 映射算好清单送过来
+// （装了装订器的机器为了 staple 另建了一条同名队列，这里只是让界面知道）
+function canStaple(p){ return (CFG.staple_printers || []).includes(p); }
+
+// 装订下拉框。不能钉的机器只留一个灰掉的「不钉」，跟色彩那格一个套路
+function stapleSelect(s){
+  if (!canStaple(s.printer))
+    return `<select class="c-staple" disabled title="这台机器没有装订队列"><option value="0">不钉</option></select>`;
+  return `<select class="c-staple" title="单钉：打完自动在左上角钉一个钉">
+    <option value="0" ${s.staple?'':'selected'}>不钉</option>
+    <option value="1" ${s.staple?'selected':''}>单钉</option></select>`;
+}
+
+function setStapleOption(sel, ok, val){
+  sel.innerHTML = '<option value="0">不钉</option>' + (ok ? '<option value="1">单钉</option>' : '');
+  sel.disabled = !ok;
+  sel.value = ok && val ? '1' : '0';
+}
+
 // 默认设置工具条的当前值，新增文件和「应用到全部」都用它
 function barValues(){
   return {
@@ -357,14 +392,16 @@ function barValues(){
     duplex: $('#dDuplex').value,
     scale: $('#dScale').value,
     pct: Math.min(400, Math.max(10, parseInt($('#dPct').value) || 100)),
-    nup: +$('#dNup').value || 1
+    nup: +$('#dNup').value || 1,
+    staple: +$('#dStaple').value || 0
   };
 }
 
-// 选彩机就自动带出彩色，选黑白机就自动带出黑白
+// 选彩机就自动带出彩色，选黑白机就自动带出黑白；换到没装订器的机器就把装订清掉
 $('#dPrinter').addEventListener('change', e=>{
   const isC = isColorMachine(e.target.value);
   setColorOptions($('#dColor'), isC, isC ? 1 : 0);
+  setStapleOption($('#dStaple'), canStaple(e.target.value), 0);
 });
 
 async function refresh(fresh){
@@ -393,6 +430,7 @@ async function refresh(fresh){
         scale: DEF.scale,
         pct: DEF.pct,
         nup: DEF.nup,
+        staple: canStaple(DEF.printer) ? DEF.staple : 0,
         range: ''          // 页码范围：留空 = 全部页
       };
     }
@@ -401,6 +439,7 @@ async function refresh(fresh){
     if (!CFG.printers.includes(s.printer)) s.printer = DEF.printer;
     if (!CFG.papers.includes(s.paper)) s.paper = f.paper || 'A4';
     if (!isColorMachine(s.printer)) s.color = 0;   // 黑白机没有彩色，避免按彩色计价
+    if (!canStaple(s.printer)) s.staple = 0;       // 没装订器的机器别留着「钉」
     if (!(s.scale in {fit:1, shrink:1, noscale:1, custom:1})) s.scale = 'fit';
     s.pct = Math.min(400, Math.max(10, parseInt(s.pct) || 100));
   }
@@ -408,7 +447,8 @@ async function refresh(fresh){
   // 文件没变就只刷状态，别冲掉正在输入的控件；页数/转换状态变了也要重画
   const sg = FILES.map(f=>f.name + '@' + f.mtime + ':' + f.pages + (f.pending ? 'p' : ''))
                    .join('|')
-           + '#' + CFG.printers.join(',') + '#' + CFG.papers.join(',');
+           + '#' + CFG.printers.join(',') + '#' + CFG.papers.join(',')
+           + '#' + (CFG.staple_printers || []).join(',');
   if (sg === SIG) paintStatus();
   else { SIG = sg; render(); }
 }
@@ -437,6 +477,7 @@ function fillSelects(){
   $('#dPrinter').value = DEF.printer;
   $('#dPaper').value = 'A4';
   setColorOptions($('#dColor'), isColorMachine(DEF.printer), DEF.color);
+  setStapleOption($('#dStaple'), canStaple(DEF.printer), DEF.staple);
 }
 
 // ---------------- 页码范围 ----------------
@@ -539,6 +580,7 @@ function render(){
         <option value="6" ${s.nup===6?'selected':''}>6 页</option>
         <option value="9" ${s.nup===9?'selected':''}>9 页</option>
         <option value="16" ${s.nup===16?'selected':''}>16 页</option></select></td>
+      <td>${stapleSelect(s)}</td>
       <td><span class="st ${cls}" ${job&&job.msg?`title="${esc(job.msg)}"`:''}>${esc(st)}</span></td>
       <td><button class="mini" data-act="pv" ${f.error?'disabled':''}>预览</button>
           <button class="mini" data-act="one">打印</button></td>
@@ -632,21 +674,24 @@ function updateStat(){
 }
 
 // ---------------- 计费记录 ----------------
-let LOG = {rows:[], today:0, total:0, count:0};
+// 一单 = 一次下单（一次命令，可以是好几个文件）。后端按「批次」归好堆，
+// 列表里一行一单显示合计，点开才铺明细。
+let LOG = {rows:[], batches:[], today:0, total:0, count:0};
+let OPENB = {};      // 展开着的批次号：轮询重画后还保持展开
 // 清空显示的时间点：只显示比它新的记录。存在浏览器里，刷新也不会把清掉的又刷回来；
 // 后端 打印记录.csv 一个字不动。
 let MARK = localStorage.getItem('lp_mark') || '';
 
-// 屏幕上该显示什么（MARK 之后的记录才算）。shortcut: 按秒比较，
-// 同一秒里又打完一单会被一起藏掉，等到下一单才看得见
+// 屏幕上该显示什么（MARK 之后的记录才算）。按批次过滤，别把一单拆成两半
 function viewLog(){
-  const rows = MARK ? LOG.rows.filter(r => (r['时间']||'') > MARK) : LOG.rows;
+  const all = LOG.batches || [];
+  const bs = MARK ? all.filter(b => (b['时间'] || '') > MARK) : all;
   const d = new Date(), pad = n => String(n).padStart(2, '0');
   const today = `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
-  const sum = a => a.reduce((s, r) => s + (parseFloat(r['金额元']) || 0), 0);
-  return {rows, count: rows.length,
-          today: sum(rows.filter(r => (r['时间']||'').startsWith(today))),
-          total: sum(rows)};
+  const sum = a => a.reduce((s, b) => s + (parseFloat(b['金额']) || 0), 0);
+  return {batches: bs, count: bs.length,
+          today: sum(bs.filter(b => (b['时间'] || '').startsWith(today))),
+          total: sum(bs)};
 }
 
 function paintMoney(){
@@ -668,26 +713,53 @@ function renderLog(){
   $('#mSum').textContent =
     `共 ${v.count} 单 · 今日 ¥${v.today.toFixed(2)} · 累计 ¥${v.total.toFixed(2)}`;
   $('#btnAllLog').style.display = MARK ? '' : 'none';   // 清空过才给「显示全部」
-  if (!v.rows.length){
+  if (!v.count){
     $('#logTable').innerHTML = `<tr><td style="padding:36px;text-align:center;color:#6d7686">` +
       `${MARK ? '显示已清空（打印记录.csv 里还在）' : '还没有打印记录'}</td></tr>`;
     return;
   }
+  const money = n => (parseFloat(n) || 0).toFixed(2);
+  const detRow = d => `<tr>
+      <td style="padding-left:26px;max-width:300px;overflow:hidden;text-overflow:ellipsis">${esc(d['文件']||'')}</td>
+      <td>${d['页数']}</td><td>${d['份数']}</td><td>${d['纸张']}</td><td>${d['色彩']}</td>
+      <td>${esc(d['打印机']||'')}</td><td>${d['单价元/页']}</td><td>${money(d['金额元'])}</td>
+    </tr>`;
   $('#logTable').innerHTML =
-    `<thead><tr><th>时间</th><th>文件</th><th>页数</th><th>份数</th><th>纸张</th>
-       <th>色彩</th><th>打印机</th><th>单价</th><th>金额</th></tr></thead><tbody>` +
-    v.rows.map(r=>`<tr>
-      <td>${esc((r['时间']||'').slice(5,16))}</td>
-      <td style="max-width:320px;overflow:hidden;text-overflow:ellipsis">${esc(r['文件']||'')}</td>
-      <td>${r['页数']}</td><td>${r['份数']}</td><td>${r['纸张']}</td><td>${r['色彩']}</td>
-      <td>${esc(r['打印机']||'')}</td><td>${r['单价元/页']}</td>
-      <td><b>¥${r['金额元']}</b></td>
-    </tr>`).join('') + '</tbody>';
+    `<thead><tr><th>时间</th><th>文件</th><th>页数</th><th>张数</th><th>金额</th></tr></thead><tbody>` +
+    v.batches.map(b=>{
+      const det = b['明细'] || [];
+      const open = !!OPENB[b['批次']];
+      // 一单里只有一个文件就直呼其名，多个就报个数，明细里再逐个看
+      const title = det.length > 1
+        ? `<span class="cnt">${det.length} 个文件</span>` : esc((det[0]||{})['文件']||'');
+      return `<tr class="log-sum${open?' open':''}" data-b="${esc(b['批次'])}">
+        <td>${esc((b['时间']||'').slice(5,16))}</td>
+        <td><span class="caret">▸</span>${title}</td>
+        <td>${b['页数']}</td><td>${b['张数']}</td>
+        <td><b>¥${money(b['金额'])}</b></td>
+      </tr>` +
+      `<tr class="log-det" data-b="${esc(b['批次'])}"${open?'':' hidden'}><td colspan="5">
+        <table><thead><tr><th>文件</th><th>页数</th><th>份数</th><th>纸张</th>
+          <th>色彩</th><th>打印机</th><th>单价/页</th><th>金额</th></tr></thead>
+          <tbody>${det.map(detRow).join('')}</tbody></table>
+      </td></tr>`;
+    }).join('') + '</tbody>';
 }
+
+// 点汇总行展开/收起这一单的明细
+$('#logTable').addEventListener('click', e=>{
+  const tr = e.target.closest('tr.log-sum'); if (!tr) return;
+  const b = tr.dataset.b;
+  const det = tr.nextElementSibling;
+  const open = !OPENB[b];
+  if (open) OPENB[b] = 1; else delete OPENB[b];
+  tr.classList.toggle('open', open);
+  if (det && det.classList.contains('log-det')) det.hidden = !open;
+});
 
 // 清掉屏幕上的记录与今日/累计（CSV 不动）
 function clearLog(){
-  const newest = (LOG.rows[0] || {})['时间'];
+  const newest = ((LOG.batches || [])[0] || {})['时间'];
   if (!newest) return toast('本来就没有记录');
   MARK = newest;
   localStorage.setItem('lp_mark', MARK);
@@ -726,7 +798,9 @@ $('#tbody').addEventListener('change', e=>{
   else if (e.target.classList.contains('c-printer')){
     s.printer = e.target.value;
     s.color = isColorMachine(s.printer) ? 1 : 0;
+    s.staple = canStaple(s.printer) ? s.staple : 0;
     tr.querySelector('.c-color').parentElement.innerHTML = colorSelect(s);  // 黑白机/彩机选项不同，整格重画
+    tr.querySelector('.c-staple').parentElement.innerHTML = stapleSelect(s); // 换到没装订器的机器就灰掉
   }
   else if (e.target.classList.contains('c-copies')){
     let v = parseInt(e.target.value) || 1;
@@ -744,6 +818,7 @@ $('#tbody').addEventListener('change', e=>{
     e.target.value = v; s.pct = v;
   }
   else if (e.target.classList.contains('c-nup')) s.nup = +e.target.value;
+  else if (e.target.classList.contains('c-staple')) s.staple = +e.target.value;
   else if (e.target.classList.contains('c-range')){
     s.range = e.target.value.trim();
     const f = FILES.find(x=>x.name === tr.dataset.n) || {pages:0};
@@ -803,7 +878,8 @@ let lastWheelAt = 0, gestureDone = false;  // 一次连续滑动里是否已经�
 function pvSummary(s, pages){
   const sc = s.scale === 'custom' ? `自定义 ${s.pct}%` : (SCALE_TXT[s.scale] || '适合');
   const nup = (s.nup && s.nup > 1) ? ` · 每张 ${s.nup} 页` : '';
-  return `${s.paper} · ${sc}${nup} · ${s.color ? '彩色' : '黑白'}` + (pages ? ` · ${pages} 页` : '');
+  const st = s.staple ? ' · 单钉' : '';
+  return `${s.paper} · ${sc}${nup}${st} · ${s.color ? '彩色' : '黑白'}` + (pages ? ` · ${pages} 页` : '');
 }
 
 function openPv(name){
@@ -944,7 +1020,9 @@ function fetchPvImg(url, id){
     const img = $('#pvImg');
     img.src = PV.obj;
     img.style.opacity = 1;
-    $('#pvPct').textContent = `${o.pct}%　${o.w}×${o.h}mm` + (o.rot ? '　已旋转90°' : '');
+    // 横向页面走横纸，就不该再显示「已旋转90°」——那是竖纸塞横向内容时的说法
+    const ori = o.rot ? '已旋转90°' : (o.w > o.h ? '横向纸' : '');
+    $('#pvPct').textContent = `${o.pct}%　${o.w}×${o.h}mm` + (ori ? `　${ori}` : '');
     $('#pvPct').title = '按纸张减去不可打印边距估算（config 里 preview_margin_mm 可调），'
                       + '实际比例由打印机驱动决定';
     $('#pvWarn').textContent = o.over ? '⚠ 内容超出纸面，超出部分会被裁掉' : '';
@@ -1063,6 +1141,7 @@ function applyAll(){
     s.paper = DEF.paper; s.duplex = DEF.duplex;
     s.scale = DEF.scale; s.pct = DEF.pct;
     s.nup = DEF.nup;
+    s.staple = (DEF.staple && canStaple(s.printer)) ? 1 : 0;   // 按行自己的机器判断
     s.color = DEF.color;
   }
   render();
@@ -1080,6 +1159,7 @@ function applySelected(){
     s.paper = DEF.paper; s.duplex = DEF.duplex;
     s.scale = DEF.scale; s.pct = DEF.pct;
     s.nup = DEF.nup;
+    s.staple = (DEF.staple && canStaple(s.printer)) ? 1 : 0;   // 按行自己的机器判断
     s.color = DEF.color;
   }
   render();
@@ -1092,7 +1172,7 @@ async function send(names, merge){
     return {name:n, printer:s.printer, copies:s.copies,
             color: !!s.color, paper:s.paper, duplex:s.duplex,
             scale: s.scale, scale_pct: s.pct, pages_spec: s.range || '',
-            nup: s.nup || 1};
+            nup: s.nup || 1, staple: s.staple ? 1 : 0};
   });
   try{
     const r = await fetch('/api/print', {method:'POST', headers:{'Content-Type':'application/json'},

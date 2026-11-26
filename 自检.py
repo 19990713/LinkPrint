@@ -53,6 +53,36 @@ d = ps.read_log()
 assert d["count"] == 2 and abs(d["total"] - 7.0) < 1e-9, d
 assert d["today"] == 7.0, d
 print("计费 OK  合计", d["total"], "首条", d["rows"][0]["文件"], d["rows"][0]["金额元"])
+
+# 一次命令发多个文件 = 一单：合计只算一单，明细各自一行
+batch = ps.new_batch()
+ps.log_job({"name": "c.pdf", "pages": 2, "copies": 3, "paper": "A4", "color": False,
+            "printer": "D95", "unit": 0.5, "amount": 3.0, "batch": batch})
+ps.log_job({"name": "d.pdf", "pages": 5, "copies": 1, "paper": "A4", "color": False,
+            "printer": "D95", "unit": 0.5, "amount": 2.5, "batch": batch})
+ps.log_job({"name": "e.pdf", "pages": 1, "copies": 2, "paper": "A4", "color": True,
+            "printer": "C7580", "unit": 2.0, "amount": 4.0, "batch": batch})
+d = ps.read_log()
+assert d["count"] == 3, d["count"]                    # 2 + 这批 1 单
+b = d["batches"][0]                                   # 最新的在最上面
+assert b["文件数"] == 3 and len(b["明细"]) == 3, b
+assert b["页数"] == 8 and b["张数"] == 6 + 5 + 2, b   # 张数按金额÷单价算，含份数
+assert abs(b["金额"] - 9.5) < 1e-9, b
+assert abs(d["total"] - 16.5) < 1e-9, d
+print("批次 OK  一单", b["文件数"], "个文件", b["张数"], "张 ¥", b["金额"])
+
+# 老 CSV（没有「批次」列）自动补列，读出来每行各自成单
+import csv as _csv
+with open(tmp, "w", newline="", encoding="utf-8-sig") as _f:
+    _w = _csv.writer(_f)
+    _w.writerow(["时间", "文件", "页数", "份数", "纸张", "色彩", "打印机",
+                 "单价元/页", "金额元"])
+    _w.writerow(["2026-01-01 09:00:00", "old.pdf", 1, 1, "A4", "黑白", "D95", "0.50", "0.50"])
+d = ps.read_log()
+assert d["count"] == 1 and d["rows"][0]["文件"] == "old.pdf", d
+with open(tmp, encoding="utf-8-sig") as _f:
+    assert "批次" in _f.readline(), "老 CSV 没补上「批次」列"
+print("老记录迁移 OK")
 os.remove(tmp)
 
 # 真实 PDF 预检
@@ -161,6 +191,22 @@ with fitz.open(files[0]) as _d:
     assert meta["pages"] == _d.page_count, meta
 assert meta["pct"] == 96 and meta["rot"] == 0 and (meta["w"], meta["h"]) == (210, 297), meta
 print(f"打印效果预览 OK  首屏 {meta['pct']}% {meta['w']}×{meta['h']}mm {len(png)//1024}KB")
+
+# 页面本身横向：预览的纸也横过来，内容不转 90°（横纸纵向送、内容转过去，纸上是一样的）
+rot, k, _r, over = ps.print_layout(A4H, A4W, "A4", "fit", paper_landscape=True)
+assert rot == 0 and not over and abs(k - (210 - 8) / 210) < 1e-3, (rot, k, over)
+land = os.path.join(tempfile.gettempdir(), "lp_land.pdf")
+try:
+    with fitz.open() as _d:
+        _d.new_page(width=A4H, height=A4W)          # 一张 A4 横向的空页
+        _d.save(land)
+    png, meta = ps.preview_png(land, "A4", "fit", 100, 1, False, 80)
+    assert png[:8] == b"\x89PNG\r\n\x1a\n", "应该是 PNG"
+    assert meta["rot"] == 0 and (meta["w"], meta["h"]) == (297, 210), meta
+    print(f"横向页预览 OK  {meta['pct']}% {meta['w']}×{meta['h']}mm 未旋转")
+finally:
+    if os.path.isfile(land):
+        os.remove(land)
 
 # ---------------- 合并打印 ----------------
 # 同参数的一组归成一份任务，准备阶段才真正拼 PDF（下单请求不等合并）
@@ -309,14 +355,20 @@ os.rmdir(tmpdir)
 print("切换热文件夹 OK，已还原为", ps.HOT)
 
 # 选择框本身：把弹窗换成固定返回值，只验证 Tk 在本进程能起能关（服务里是在 HTTP 线程里起）
-from tkinter import filedialog
-_fb = filedialog.askdirectory
-filedialog.askdirectory = lambda **kw: "X"
+# 有的 Python 发行版没带 tkinter（本机 env 就没有），这时候跳过，别让后面的检查全跑不成
 try:
-    assert ps.pick_folder() == "X"
-finally:
-    filedialog.askdirectory = _fb
-print("文件夹选择框 OK")
+    from tkinter import filedialog as _fd
+except ImportError:
+    _fd = None
+    print("[跳过] 文件夹选择框：这个 Python 没装 tkinter")
+if _fd:
+    _fb = _fd.askdirectory
+    _fd.askdirectory = lambda **kw: "X"
+    try:
+        assert ps.pick_folder() == "X"
+    finally:
+        _fd.askdirectory = _fb
+    print("文件夹选择框 OK")
 
 # ---------------- 多页（N-up）拼版 ----------------
 try:
@@ -371,6 +423,35 @@ if ps.gdi_print:
     print("GDI 引擎 OK  ", ps.ENGINE, "并行" if ps.PARALLEL else "串行",
           f"{len(ps.PRINT_QUEUES)} 条队列")
 
+# 线稿判定：CAD 那种"描边又多又细"的页要认出来，普通页不能误判
+# （误判的代价是关掉抗锯齿，照片和普通文档会变毛边，所以两头都得测）
+if ps.gdi_print:
+    import pymupdf as _fitz
+
+    def _mk(thin, n=400):
+        """造一页只有描边的 PDF：thin=True 画 0.06pt 发丝线，False 画 2pt 粗线"""
+        _d = _fitz.open()
+        _p = _d.new_page(width=595, height=842)
+        for _i in range(n):
+            _y = 40 + _i * (842 - 80) / n
+            _p.draw_line((40, _y), (555, _y), color=(0, 0, 0),
+                         width=0.06 if thin else 2)
+        return _d, _p
+
+    _d, _p = _mk(True)
+    assert ps.gdi_print.is_lineart(_p) is True, "0.06pt 的 CAD 图纸应该判成线稿"
+    _d.close()
+    _d, _p = _mk(False)
+    assert ps.gdi_print.is_lineart(_p) is False, "粗线描边不该判成线稿"
+    _d.close()
+    # 线条再多，页面上有真位图（照片/扫描件）就不是线稿
+    _d, _p = _mk(True)
+    _p.insert_image(_fitz.Rect(100, 300, 500, 700),
+                    pixmap=_fitz.Pixmap(_fitz.csRGB, _fitz.IRect(0, 0, 400, 400), 0))
+    assert ps.gdi_print.is_lineart(_p) is False, "带位图的页不该判成线稿"
+    _d.close()
+    print("线稿判定 OK  发丝线页关抗锯齿，粗线页/带图页不动")
+
 # 真实打印机的可打印区域（只读，不出纸）。离线/没装的跳过，不当失败
 if ps.gdi_print and ps.PRINTERS:
     for _p in ps.PRINTERS:
@@ -382,6 +463,16 @@ if ps.gdi_print and ps.PRINTERS:
                   f"纸 {_c['paper_mm'][0]}×{_c['paper_mm'][1]}mm")
         except Exception as _e:
             print(f"  [跳过] {_p}：{_e}")
+
+# 装订队列：config.json 配了映射就得真的解析到本机队列（没配/没解析到不算失败，
+# 只是前端不出「装订」这个选项）
+if ps.STAPLE:
+    for _b, _s in ps.STAPLE.items():
+        assert _b in ps.PRINTERS, (_b, ps.PRINTERS)
+        assert _s != _b, (_b, _s)
+        assert ps.spool_queue({"printer": _b, "staple": 1}) == _s
+        assert ps.spool_queue({"printer": _b, "staple": 0}) == _b
+        print(f"装订队列 OK  {_b} -> {_s}")
 
 # 送印队列：任务只会进它那台打印机的队列
 if ps.PRINTER_Q:

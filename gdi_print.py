@@ -15,10 +15,18 @@ SumatraPDF 的 `-print-to` 要 53.9 秒，而这 54 秒里它自己的 CPU 只�
 - 位图按驱动 DPI 1:1 送，不经缩放重采样
 - 送印在独立子进程里跑，驱动崩了只崩这个子进程，网页服务不受影响
 
+**线稿模式**（`--lineart auto`，默认）：CAD 图纸那种整页 0.06pt 发丝线的 PDF，
+600dpi 下一条线不到半个设备点，抗锯齿把它摊成 40% 左右的灰，单色机再一抖动就成了
+断断续续的点线——所以这类页渲染时关掉抗锯齿，线直接钉成 1 个设备点的实黑，和
+Acrobat 送矢量打出来的一样清楚。判定条件是"描边又多又细 + 页面上没有真位图"，
+照片页、普通文档不受影响（见 `is_lineart`）。
+
 用法（父进程 print_system.py 就是这么调的）：
     python gdi_print.py <pdf> <打印机名> [--copies N] [--paper A4] [--duplex single]
                         [--scale fit] [--color 1] [--range 1-3,5] [--nup 4]
+                        [--lineart auto|on|off]
     python gdi_print.py --probe <打印机名>      # 只读设备能力，不出纸
+    python gdi_print.py x.pdf 打印机 --preview-png out.png   # 只存"要送印的位图"，不出纸
 
 --nup N（每张纸印 N 页）在送印层直接排版：一张纸上 StartPage 一次、画 N 个格子，
 不需要先把 N 页拼成一份新 PDF 再打。--range 也照旧有效——先按页号挑页，再按顺序排格子。
@@ -79,6 +87,12 @@ COLORONCOLOR, HALFTONE = 3, 4
 # 超过上限就按比例降分辨率渲染、再交给 StretchDIBits 拉伸回原尺寸，别把内存吃穿。
 MAX_PIXELS = 120_000_000
 MM_PER_INCH = 25.4
+
+# ---- 线稿页判定（见 is_lineart）----
+LINEART_MIN_DRAWINGS = 300       # 描边条数下限：CAD 立面/平面动辄上千条，Word 讲义只有几十条
+LINEART_HAIRLINE_PT = 0.25       # 描边中位线宽上限：细到 0.25pt 以下才是"发丝线"，才值得关 AA
+LINEART_MIN_IMG_PT = 100         # 一边小于 100pt 的图（logo、线型样本）不算照片
+LINEART_IMG_AREA = 0.2           # 面积不到整页 20% 的图也不算照片（线稿图上贴张小图很常见）
 
 
 def _emit(line):
@@ -360,19 +374,74 @@ def _blit(dib, hdc, dw, dh, x, y):
         raise PrintError("位图送驱动被拒（StretchDIBits 返回 0）", code=3)
 
 
+# ---------------- 线稿页 ----------------
+
+def is_lineart(page):
+    """判断这一页是不是纯矢量线稿（CAD 图纸、机加工图、图表）。
+
+    为什么要单独认这一类页：图纸的线常常只有 0.06pt（0.021mm），600dpi 一个设备点是
+    0.0423mm，一条线在纸上还不到半个设备点。抗锯齿渲染会把它摊成覆盖率四五十的灰，
+    单色机再用 HALFTONE 一抖动，就成了断断续续的点线——看着就是"线条看不清"。
+    关掉抗锯齿后 MuPDF 直接把这种线钉成 1 个设备点的实黑，和 Acrobat 送矢量、
+    驱动自己做"细线增强"的结果一致。
+
+    判定三条：描边够多（≥300 条）、描边中位线宽 ≤0.25pt、页面上没有成块的位图。
+    先用 get_bboxlog() 数描边条数（比 get_drawings 快三五倍），条数不够就直接否掉，
+    普通讲义/Word 文档（描边才几条）连解析路径这一步都省了。线型样本那种 1 像素高的
+    小图、模板蒙版（fill-imgmask）、标题栏里的小 logo 都不算"照片"，不然图纸一律会被
+    当成图片页。真照片/扫描件要"够大"才算：一边 ≥100pt 且面积占整页 ≥20%。
+    """
+    try:
+        page_area = abs(page.rect.width * page.rect.height) or 1.0
+        strokes = 0
+        for op, r in page.get_bboxlog():
+            if op == "fill-image":
+                iw, ih = r[2] - r[0], r[3] - r[1]
+                if (iw >= LINEART_MIN_IMG_PT and ih >= LINEART_MIN_IMG_PT
+                        and iw * ih >= page_area * LINEART_IMG_AREA):
+                    return False                # 成块的位图（照片、扫描件、彩色贴图）
+            elif op == "stroke-path":
+                strokes += 1
+        if strokes < LINEART_MIN_DRAWINGS:
+            return False
+        widths = [d["width"] for d in page.get_drawings() if d.get("width")]
+        if not widths or float(np.median(widths)) > LINEART_HAIRLINE_PT:
+            return False
+        return True
+    except Exception:
+        return False                            # 分析失败就当普通页，宁可不优化也别打错
+
+
+def _pixmap(page, scale, lineart):
+    """按 scale 渲染一页。lineart=True 时临时关掉抗锯齿（进程级开关，用完还原）。"""
+    m = fitz.Matrix(scale, scale)
+    if not lineart:
+        return page.get_pixmap(matrix=m, colorspace=fitz.csRGB, alpha=False)
+    old = fitz.TOOLS.show_aa_level().get("graphics", 8)
+    try:
+        fitz.TOOLS.set_aa_level(0)
+        return page.get_pixmap(matrix=m, colorspace=fitz.csRGB, alpha=False)
+    finally:
+        fitz.TOOLS.set_aa_level(old)
+
+
 # ---------------- 主流程 ----------------
 
 def print_pdf(path, printer, copies=1, paper="A4", duplex="single",
-              scale="fit", color=False, page_spec="", probe=False, nup=1):
+              scale="fit", color=False, page_spec="", probe=False, nup=1,
+              lineart="auto", preview_png=None):
     """把一个 PDF 送到打印机。probe=True 只读设备能力，不建打印作业。
 
     nup>1 时每张纸印 nup 页：在送印层按格子排版，不需要先拼一份 PDF 出来。
+    lineart：auto（默认，按页判定线稿）/ on / off，决定要不要关抗锯齿。
+    preview_png：只把第一页"准备送印的那张位图"存成 PNG，不出纸（调试用）。
     """
     if not available():
         raise PrintError("当前环境不支持 GDI 送印（缺 numpy 或不是 Windows）", code=5)
     a = api()
     mode = SCALE_ID.get(scale, "fit")
     nup = 1 if nup in (None, "") else int(nup)
+    lineart = lineart if lineart in ("auto", "on", "off") else "auto"
     if nup not in NUP_GRID:
         raise PrintError(f"每页张数只能是 {'/'.join(map(str, NUP_GRID))}", code=5)
 
@@ -393,7 +462,8 @@ def print_pdf(path, printer, copies=1, paper="A4", duplex="single",
             if not hdc:
                 raise PrintError(f"CreateDC 失败「{printer}」（错误码 {ctypes.get_last_error()}）")
             try:
-                return _run(doc, pages, hdc, printer, mode, color, path, nup)
+                return _run(doc, pages, hdc, printer, mode, color, path, nup,
+                            lineart_mode=lineart, preview_png=preview_png)
             finally:
                 gdi32.DeleteDC(hdc)
         finally:
@@ -402,7 +472,61 @@ def print_pdf(path, printer, copies=1, paper="A4", duplex="single",
         doc.close()
 
 
-def _run(doc, pages, hdc, printer, mode, color, path, nup=1):
+def _render_page(page, geo, mode, nup, j, cols, lineart):
+    """算一页的位置和缩放，渲染成 DIB。返回 (pix, dib, dw, dh, x, y)，空页返回 None。
+
+    geo = (w, h, dpi, paper_landscape, cell_w, cell_h)，就是可打印区域和格子尺寸。
+    """
+    w, h, dpi, paper_landscape, cell_w, cell_h = geo
+    pw, ph = page.rect.width / 72.0, page.rect.height / 72.0      # 英寸
+    if pw <= 0 or ph <= 0:
+        return None
+    if nup > 1:
+        # 拼版格子：不旋转（纸已按网格转过来了），每页独立等比缩进自己那格。
+        # 缩放档对格子没有意义——塞不进格子就白打，所以一律按 fit。
+        rot, cw, ch = 0, pw, ph
+        k = min(cell_w / (cw * dpi), cell_h / (ch * dpi))
+        r_, c_ = divmod(j, cols)
+    else:
+        rot = 90 if (pw > ph) != paper_landscape else 0
+        cw, ch = (ph, pw) if rot else (pw, ph)                    # 旋转后的英寸尺寸
+        fit = min(w / (cw * dpi), h / (ch * dpi))
+        if mode == "fit":
+            k = fit
+        elif mode == "shrink":
+            k = min(1.0, fit)                  # 只缩不放
+        else:
+            k = 1.0                            # noscale / custom（比例已烘进 PDF）
+        r_, c_ = 0, 0
+    px_w, px_h = cw * dpi * k, ch * dpi * k
+    rk = k
+    if px_w * px_h > MAX_PIXELS:           # 太大会吃爆内存，降分辨率再拉伸
+        rk = k * (MAX_PIXELS / (px_w * px_h)) ** 0.5
+    scale = dpi * rk / 72.0
+    if scale <= 0:
+        return None
+    pix = _pixmap(page, scale, lineart)
+    dib = _dib(pix, rot)
+    dw, dh = max(1, int(round(px_w))), max(1, int(round(px_h)))
+    if nup > 1:                            # 摆进自己那一格，格内居中
+        x = max(0, int(round(c_ * cell_w + (cell_w - dw) / 2)))
+        y = max(0, int(round(r_ * cell_h + (cell_h - dh) / 2)))
+    else:
+        x, y = max(0, (w - dw) // 2), max(0, (h - dh) // 2)        # 居中
+    return pix, dib, dw, dh, x, y
+
+
+def _lineart_of(page, lineart_mode):
+    """--lineart auto 按页面自动判；on/off 是给调试和"这张图我一定要这么打"留的手动挡。"""
+    if lineart_mode == "on":
+        return True
+    if lineart_mode == "off":
+        return False
+    return is_lineart(page)
+
+
+def _run(doc, pages, hdc, printer, mode, color, path, nup=1,
+         lineart_mode="auto", preview_png=None):
     gdi32 = api()["gdi32"]
     w = gdi32.GetDeviceCaps(hdc, HORZRES)          # 可打印区域（设备像素）
     h = gdi32.GetDeviceCaps(hdc, VERTRES)
@@ -416,6 +540,16 @@ def _run(doc, pages, hdc, printer, mode, color, path, nup=1):
     # 多页缩印：把可打印区域切成 rows×cols 个格子。nup=1 时整张纸就是一格。
     rows, cols = NUP_GRID.get(nup, (1, 1))
     cell_w, cell_h = w / cols, h / rows
+    geo = (w, h, dpi, paper_landscape, cell_w, cell_h)
+
+    if preview_png:
+        # 调试用：只把第一页渲染成"准备送印的那张位图"存盘，不建打印作业、不出纸
+        page = doc[pages[0] - 1]
+        res = _render_page(page, geo, mode, nup, 0, cols, _lineart_of(page, lineart_mode))
+        if not res:
+            raise PrintError("这一页没有可打印的内容", code=5)
+        res[0].save(preview_png)
+        return {"pages": 0, "sheets": 0, "printed": 0, "preview": preview_png}
 
     di = DOCINFOW(ctypes.sizeof(DOCINFOW), os.path.basename(path), None, None, 0)
     # StartDoc 的返回值就是 spooler 里的作业号：父进程取消打印时用它 SetJob 删作业，
@@ -429,7 +563,8 @@ def _run(doc, pages, hdc, printer, mode, color, path, nup=1):
 
     sent = 0
     gdi32.SetMapMode(hdc, 1)                        # MM_TEXT：一个单位 = 一个设备像素
-    # 单色机要让 GDI 自己去做抖动（否则灰阶层次全丢成纯黑纯白）；彩机逐色直传
+    # 单色机要让 GDI 自己去做抖动（否则灰阶层次全丢成纯黑纯白）；彩机逐色直传。
+    # 线稿页渲染出来本来就是黑白两色，抖动对它没有副作用，不用单独改模式。
     gdi32.SetStretchBltMode(hdc, COLORONCOLOR if color else HALFTONE)
     if not color:
         gdi32.SetBrushOrgEx(hdc, 0, 0, None)
@@ -439,43 +574,12 @@ def _run(doc, pages, hdc, printer, mode, color, path, nup=1):
                 raise PrintError("StartPage 失败（打印队列可能被暂停）", code=3)
             for j, no in enumerate(pages[i:i + nup]):
                 page = doc[no - 1]
-                pw, ph = page.rect.width / 72.0, page.rect.height / 72.0      # 英寸
-                if pw <= 0 or ph <= 0:
+                res = _render_page(page, geo, mode, nup, j, cols,
+                                   _lineart_of(page, lineart_mode))
+                if res is None:
                     continue
-                if nup > 1:
-                    # 拼版格子：不旋转（纸已按网格转过来了），每页独立等比缩进自己那格。
-                    # 缩放档对格子没有意义——塞不进格子就白打，所以一律按 fit。
-                    rot, cw, ch = 0, pw, ph
-                    k = min(cell_w / (cw * dpi), cell_h / (ch * dpi))
-                    r_, c_ = divmod(j, cols)
-                else:
-                    rot = 90 if (pw > ph) != paper_landscape else 0
-                    cw, ch = (ph, pw) if rot else (pw, ph)                    # 旋转后的英寸尺寸
-                    fit = min(w / (cw * dpi), h / (ch * dpi))
-                    if mode == "fit":
-                        k = fit
-                    elif mode == "shrink":
-                        k = min(1.0, fit)                  # 只缩不放
-                    else:
-                        k = 1.0                            # noscale / custom（比例已烘进 PDF）
-                    r_, c_ = 0, 0
-                px_w, px_h = cw * dpi * k, ch * dpi * k
-                rk = k
-                if px_w * px_h > MAX_PIXELS:           # 太大会吃爆内存，降分辨率再拉伸
-                    rk = k * (MAX_PIXELS / (px_w * px_h)) ** 0.5
-                scale = dpi * rk / 72.0
-                if scale <= 0:
-                    continue
-                pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale),
-                                      colorspace=fitz.csRGB, alpha=False)
-                dib = _dib(pix, rot)
-                pix = None
-                dw, dh = max(1, int(round(px_w))), max(1, int(round(px_h)))
-                if nup > 1:                            # 摆进自己那一格，格内居中
-                    x = max(0, int(round(c_ * cell_w + (cell_w - dw) / 2)))
-                    y = max(0, int(round(r_ * cell_h + (cell_h - dh) / 2)))
-                else:
-                    x, y = max(0, (w - dw) // 2), max(0, (h - dh) // 2)        # 居中
+                pix, dib, dw, dh, x, y = res
+                pix = None                          # 位图已经搬进 dib，别占着内存
                 _blit(dib, hdc, dw, dh, x, y)
                 dib = None
             if gdi32.EndPage(hdc) <= 0:
@@ -509,6 +613,10 @@ def main(argv):
     ap.add_argument("--range", dest="page_spec", default="")
     ap.add_argument("--nup", type=int, default=1, choices=sorted(NUP_GRID),
                     help="每张纸印几页（默认 1）")
+    ap.add_argument("--lineart", default="auto", choices=["auto", "on", "off"],
+                    help="线稿页关抗锯齿：auto 按页判定（默认），on 强制，off 关闭")
+    ap.add_argument("--preview-png", metavar="PNG", default=None,
+                    help="只把第一页准备送印的位图存成 PNG，不出纸（调试用）")
     ap.add_argument("--probe", action="store_true", help="只读设备能力，不出纸")
     args = ap.parse_args(argv)
 
@@ -524,7 +632,8 @@ def main(argv):
             raise PrintError(f"文件不存在：{args.pdf}", code=5)
         r = print_pdf(args.pdf, args.printer, copies=args.copies, paper=args.paper,
                       duplex=args.duplex, scale=args.scale, color=bool(args.color),
-                      page_spec=args.page_spec, nup=args.nup)
+                      page_spec=args.page_spec, nup=args.nup, lineart=args.lineart,
+                      preview_png=args.preview_png)
         sys.stdout.write(json.dumps(r, ensure_ascii=False) + "\n")
         return 0
     except PrintError as e:
